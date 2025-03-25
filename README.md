@@ -18,6 +18,7 @@
 ### Guia de instalação
 
 1. Faça o clone desse projeto no local desejado
+
 ``git clone https://github.com/gstvpassos/Automacao-Avancada.git``
 
 2. Em seguida, no diretório do projeto instale as bibliotecas com os comandos Maven (não esqueça de substituir para o diretório em que seu projeto se encontra). Esse comando irá instalar todas as dependências que estão no pom.xml, cujo arquivo se encontra no diretório do comando.
