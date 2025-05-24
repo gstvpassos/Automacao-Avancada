@@ -168,7 +168,7 @@ implements StepAdvanceListener
 	private final ChangeSpeedQuery csqvar_ChangeSpeed;
 	
 	private final ChangeObjectVarQuery.ChangeIntegerQ csqvar_ChangeLaneChangeMode;
-	Vehicle (
+	public Vehicle (
 		DataInputStream dis,
 		DataOutputStream dos, 
 		String id

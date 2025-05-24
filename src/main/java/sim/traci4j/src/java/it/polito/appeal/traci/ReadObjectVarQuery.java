@@ -234,7 +234,7 @@ public abstract class ReadObjectVarQuery<V> extends ValueReadQuery<V> {
 	 */
 	public static class StringListQ extends ReadObjectVarQuery<List<String>> {
 
-		StringListQ(DataInputStream dis, DataOutputStream dos, int commandID,
+		public StringListQ(DataInputStream dis, DataOutputStream dos, int commandID,
 				String objectID, int varID) {
 			super(dis, dos, commandID, objectID, varID);
 		}

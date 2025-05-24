@@ -1,5 +1,7 @@
 package io.sim;
 
+import io.sim.utils.GeoUtils;
+
 public class DrivingData {
 
 	/* SUMO's data */
@@ -9,6 +11,7 @@ public class DrivingData {
 	private long timeStamp; 			// System.currentTimeMillis()
 	private double x_Position; 			// sumoPosition2D (x)
 	private double y_Position; 			// sumoPosition2D (y)
+	private double []latLon;                 // Latitude e Longitude
 	private String roadIDSUMO; 			// this.sumo.do_job_get(Vehicle.getRoadID(this.idAuto))
 	private String routeIDSUMO; 		// this.sumo.do_job_get(Vehicle.getRouteID(this.idAuto))
 	private double speed; 				// in m/s for the last time step
@@ -135,7 +138,7 @@ public class DrivingData {
 
 	public DrivingData(
 
-			String _autoID, String _driverID, long _timeStamp, double _x_Position, double _y_Position,
+			String _autoID, String _driverID, long _timeStamp, double _x_Position, double _y_Position, double[] _latLon,
 			String _roadIDSUMO, String _routeIDSUMO, double _speed, double _odometer, double _fuelConsumption,
 			double _averageFuelConsumption, int _fuelType, double _fuelPrice, double _co2Emission, double _HCEmission, int _personCapacity, int _personNumber) {
 
@@ -144,6 +147,7 @@ public class DrivingData {
 		this.timeStamp = _timeStamp;
 		this.x_Position = _x_Position;
 		this.y_Position = _y_Position;
+		this.latLon = _latLon;
 		this.roadIDSUMO = _roadIDSUMO;
 		this.routeIDSUMO = _routeIDSUMO;
 		this.speed = _speed;
@@ -181,6 +185,10 @@ public class DrivingData {
 
 	public double getY_Position() {
 		return this.y_Position;
+	}
+
+	public double[] getLatLon(){
+		return GeoUtils.convertToGeo(x_Position, y_Position);
 	}
 
 	public long getTimeStamp() {

@@ -72,7 +72,7 @@ public class Repository<V extends TraciObject<?>> {
 	 * @param idListQuery
 	 *            a reference to a query of list of IDs.
 	 */
-	Repository(ObjectFactory<V> factory, StringListQ idListQuery) {
+	public Repository(ObjectFactory<V> factory, StringListQ idListQuery) {
 		this.factory = factory;
 		this.idListQuery = idListQuery;
 	}
@@ -189,8 +189,8 @@ public class Repository<V extends TraciObject<?>> {
 		}
 	}
 
-	static class Edges extends UpdatableRepository<Edge> {
-		Edges(final DataInputStream dis, final DataOutputStream dos, StringListQ idListQuery) {
+	public static class Edges extends UpdatableRepository<Edge> {
+		public Edges(final DataInputStream dis, final DataOutputStream dos, StringListQ idListQuery) {
 			super(new ObjectFactory<Edge>() {
 				public Edge newObject(String objectID) {
 					return new Edge(dis, dos, objectID);
@@ -199,8 +199,8 @@ public class Repository<V extends TraciObject<?>> {
 		}
 	}
 
-	static class Lanes extends Repository<Lane> {
-		Lanes(final DataInputStream dis, final DataOutputStream dos, final Repository<Edge> edges,
+	public static class Lanes extends Repository<Lane> {
+		public Lanes(final DataInputStream dis, final DataOutputStream dos, final Repository<Edge> edges,
 				StringListQ idListQuery) {
 			super(null, idListQuery);
 
@@ -214,7 +214,7 @@ public class Repository<V extends TraciObject<?>> {
 
 	static class Vehicles extends UpdatableRepository<Vehicle> {
 
-		Vehicles(final DataInputStream dis, final DataOutputStream dos, final Repository<Edge> edges,
+		public Vehicles(final DataInputStream dis, final DataOutputStream dos, final Repository<Edge> edges,
 				 final Repository<Lane> lanes, final Map<String, Vehicle> vehicles, final StringListQ idListQuery) {
 			super(new ObjectFactory<Vehicle>() {
 				/**
