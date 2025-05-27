@@ -8,6 +8,7 @@ import java.net.Socket;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -27,7 +28,7 @@ public class FuelStation extends Thread {
     private Account account;
     
     // Controle de execução
-    private boolean running;
+    private AtomicBoolean running = new AtomicBoolean(false);
     
     // Preços dos combustíveis
     private double dieselPrice;    // Preço do diesel por litro
@@ -48,10 +49,26 @@ public class FuelStation extends Thread {
     private final Semaphore pumpSemaphore;
     
     // Fila de carros aguardando abastecimento
-    private final Queue<Car> waitingCars;
+    private final Queue<RefuelRequest> waitingCars;
     
     // Objeto de sincronização para notificação
     private final Object refuelLock = new Object();
+    
+    // Bot de pagamento para receber pagamentos
+    private BotPayment botPayment;
+    
+    /**
+     * Classe interna para representar uma solicitação de abastecimento
+     */
+    private static class RefuelRequest {
+        Car car;
+        double amount;
+        
+        public RefuelRequest(Car car, double amount) {
+            this.car = car;
+            this.amount = amount;
+        }
+    }
     
     /**
      * Construtor principal da FuelStation.
@@ -64,13 +81,13 @@ public class FuelStation extends Thread {
         this.stationId = stationId;
         this.name = name;
         this.account = account;
-        this.running = false;
+        this.running.set(false);
         this.connected = false;
         
         // Preços padrão dos combustíveis
-        this.dieselPrice = 5.87;
+        this.dieselPrice = 5.20;
         this.gasolinePrice = 5.87;
-        this.ethanolPrice = 5.87;
+        this.ethanolPrice = 4.59;
         
         // Inicializa o semáforo com 2 permissões (2 bombas)
         this.pumpSemaphore = new Semaphore(2, true);
@@ -78,7 +95,15 @@ public class FuelStation extends Thread {
         // Inicializa a fila de carros aguardando
         this.waitingCars = new ConcurrentLinkedQueue<>();
         
-        logger.info("FuelStation " + stationId + " criada");
+        // Inicializa o bot de pagamento
+        try {
+            this.botPayment = new BotPayment(account, "localhost", 12345);
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "Erro ao inicializar BotPayment: " + e.getMessage(), e);
+            // Continua mesmo sem o bot de pagamento
+        }
+        
+        logger.info("FuelStation " + stationId + " criada com sucesso");
     }
     
     /**
@@ -94,14 +119,11 @@ public class FuelStation extends Thread {
      */
     public FuelStation(String stationId, String name, String bankHost, int bankPort, 
                       String login, String senha, double initialBalance) {
-        this(stationId, name, null);
+        this(stationId, name, new Account(senha, login, initialBalance));
         this.bankHost = bankHost;
         this.bankPort = bankPort;
         this.login = login;
         this.senha = senha;
-        
-        // Cria uma conta local temporária até conectar ao banco
-        this.account = new Account(senha, login, initialBalance);
     }
     
     /**
@@ -110,16 +132,29 @@ public class FuelStation extends Thread {
      */
     @Override
     public void run() {
-        this.running = true;
+        this.running.set(true);
         
         logger.info("FuelStation " + stationId + " iniciada");
         
-        // Conecta ao AlphaBank se as informações de conexão foram fornecidas
-        if (bankHost != null && bankPort > 0) {
-            connectToBank();
+        // Inicia o bot de pagamento se foi criado com sucesso
+        if (botPayment != null) {
+            botPayment.start();
+            logger.info("BotPayment da FuelStation iniciado");
+        } else {
+            logger.warning("BotPayment não disponível para a FuelStation");
         }
         
-        while (running) {
+        // Conecta ao AlphaBank se as informações de conexão foram fornecidas
+        if (bankHost != null && bankPort > 0) {
+            try {
+                connectToBank();
+            } catch (Exception e) {
+                logger.log(Level.WARNING, "Erro ao conectar ao AlphaBank: " + e.getMessage(), e);
+                // Continua mesmo sem conexão com o banco
+            }
+        }
+        
+        while (running.get()) {
             try {
                 // Processa carros na fila de espera
                 processWaitingCars();
@@ -127,16 +162,32 @@ public class FuelStation extends Thread {
                 // Aguarda um curto período antes de verificar novamente
                 Thread.sleep(500);
             } catch (InterruptedException e) {
-                if (!running) {
+                if (!running.get()) {
                     break;
                 }
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
                 logger.log(Level.SEVERE, "Erro na execução da FuelStation " + stationId, e);
+                
+                try {
+                    // Pausa para evitar spam de erros
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    if (!running.get()) {
+                        break;
+                    }
+                }
             }
         }
         
         // Desconecta do banco ao finalizar
         disconnectFromBank();
+        
+        // Para o bot de pagamento
+        if (botPayment != null) {
+            botPayment.stopBot();
+        }
         
         logger.info("FuelStation " + stationId + " finalizada");
     }
@@ -147,8 +198,8 @@ public class FuelStation extends Thread {
     private void processWaitingCars() {
         // Verifica se há carros na fila e bombas disponíveis
         while (!waitingCars.isEmpty() && pumpSemaphore.availablePermits() > 0) {
-            Car car = waitingCars.poll();
-            if (car != null) {
+            RefuelRequest request = waitingCars.poll();
+            if (request != null && request.car != null) {
                 // Inicia uma thread para processar o abastecimento
                 new Thread(() -> {
                     try {
@@ -156,41 +207,31 @@ public class FuelStation extends Thread {
                         pumpSemaphore.acquire();
                         
                         // Realiza o abastecimento
-                        double amount = 10.0; // Quantidade padrão para encher o tanque
-                        double currentFuel = car.getFuelTank();
-                        double maxFuel = 10.0; // Capacidade máxima do tanque
-                        amount = Math.min(amount, maxFuel - currentFuel);
-                        
-                        if (amount > 0) {
-                            // Calcula o valor e realiza o abastecimento
-                            double totalValue = calculateRefuelValue(car, amount);
-                            
-                            logger.info("Iniciando abastecimento do carro " + car.getIdCar() + 
-                                       " com " + amount + " litros. Valor: R$ " + totalValue);
-                            
-                            // Simula o tempo de abastecimento (2 minutos)
-                            Thread.sleep(120000); // 2 minutos
-                            
-                            // Atualiza o tanque do carro
-                            car.setFuelTank(currentFuel + amount);
-                            
-                            logger.info("Abastecimento do carro " + car.getIdCar() + " concluído. " +
-                                       "Novo nível do tanque: " + car.getFuelTank() + " litros");
-                            
-                            // Notifica o carro que o abastecimento foi concluído
-                            synchronized (car) {
-                                car.setRefueling(false);
-                                car.notify();
-                            }
+                        double amount = request.amount;
+                        if (amount <= 0) {
+                            amount = 10.0; // Quantidade padrão para encher o tanque
                         }
+                        
+                        // Calcula o valor e realiza o abastecimento
+                        double totalValue = calculateRefuelValue(request.car, amount);
+                        
+                        logger.info("Iniciando abastecimento do carro " + request.car.getIdCar() + 
+                                   " com " + amount + " litros. Valor: R$ " + totalValue);
+                        
+                        // Simula o tempo de abastecimento (reduzido para 10 segundos para testes)
+                        Thread.sleep(10000);
+                        
+                        // Adiciona combustível ao carro
+                        requestRefuel(request.car,amount);
+                        
+                        logger.info("Abastecimento do carro " + request.car.getIdCar() + " concluído. " +
+                                   "Novo nível do tanque: " + request.car.getFuelTank() + " litros");
+                        
+                        // Registra o pagamento (será processado pelo Driver)
+                        logger.info("Valor a ser pago: R$ " + totalValue + " pelo abastecimento do carro " + request.car.getIdCar());
+                        
                     } catch (Exception e) {
-                        logger.log(Level.SEVERE, "Erro ao abastecer o carro " + car.getIdCar(), e);
-                        
-                        // Notifica o carro em caso de erro
-                        synchronized (car) {
-                            car.setRefueling(false);
-                            car.notify();
-                        }
+                        logger.log(Level.SEVERE, "Erro ao abastecer o carro " + request.car.getIdCar(), e);
                     } finally {
                         // Libera a bomba
                         pumpSemaphore.release();
@@ -200,7 +241,7 @@ public class FuelStation extends Thread {
                             refuelLock.notifyAll();
                         }
                     }
-                }).start();
+                }, "Refuel-" + request.car.getIdCar()).start();
             }
         }
     }
@@ -209,7 +250,7 @@ public class FuelStation extends Thread {
      * Para a execução do posto.
      */
     public void stopStation() {
-        this.running = false;
+        this.running.set(false);
         this.interrupt();
     }
     
@@ -353,23 +394,20 @@ public class FuelStation extends Thread {
      * Solicita abastecimento de um carro.
      * 
      * @param car Carro a ser abastecido
-     * @param driverId ID do motorista
+     * @param amount Quantidade de combustível a ser adicionada
      * @return true se a solicitação foi aceita, false caso contrário
      */
-    public boolean requestRefuel(Car car, String driverId) {
+    public boolean requestRefuel(Car car, double amount) {
         if (car == null) {
             logger.warning("Solicitação de abastecimento com carro nulo");
             return false;
         }
         
         logger.info("Solicitação de abastecimento recebida para o carro " + car.getIdCar() + 
-                   " do motorista " + driverId);
-        
-        // Marca o carro como em abastecimento
-        car.setRefueling(true);
+                   " com " + amount + " litros");
         
         // Adiciona o carro à fila de espera
-        waitingCars.add(car);
+        waitingCars.add(new RefuelRequest(car, amount));
         
         // Notifica threads aguardando por novos carros
         synchronized (refuelLock) {
@@ -377,33 +415,6 @@ public class FuelStation extends Thread {
         }
         
         return true;
-    }
-    
-    /**
-     * Realiza o abastecimento de um carro.
-     * Este método é chamado internamente após adquirir uma bomba.
-     * 
-     * @param car Carro a ser abastecido
-     * @param amount Quantidade de combustível em litros
-     * @return Valor total do abastecimento
-     */
-    public synchronized double refuelCar(Car car, double amount) {
-        if (car == null || amount <= 0) {
-            logger.warning("Solicitação de abastecimento inválida");
-            return 0.0;
-        }
-        
-        // Calcula o valor com base no tipo de combustível
-        double totalValue = calculateRefuelValue(car, amount);
-        
-        // Atualiza o tanque do carro
-        double currentFuel = car.getFuelTank();
-        car.setFuelTank(currentFuel + amount);
-        
-        logger.info("Abastecimento do carro " + car.getIdCar() + " concluído. " +
-                   "Valor: R$ " + totalValue + ", Novo nível: " + car.getFuelTank() + " litros");
-        
-        return totalValue;
     }
     
     /**
@@ -435,103 +446,46 @@ public class FuelStation extends Thread {
     }
     
     /**
-     * Processa o pagamento de um abastecimento.
+     * Recebe pagamento de um abastecimento.
      * 
-     * @param driverAccount Conta do motorista
+     * @param fromAccount Conta de origem
      * @param amount Valor a ser pago
      * @param description Descrição do pagamento
      * @return true se o pagamento foi processado com sucesso, false caso contrário
      */
-    public boolean processPayment(Account driverAccount, double amount, String description) {
-        if (driverAccount == null || amount <= 0) {
-            logger.warning("Solicitação de pagamento inválida");
+    public boolean receivePayment(String fromAccount, double amount, String description) {
+        if (amount <= 0) {
+            logger.warning("Valor de pagamento inválido: " + amount);
             return false;
         }
         
-        logger.info("Processando pagamento de R$ " + amount + " da conta " + 
-                   driverAccount.getLogin() + " para o posto " + stationId);
+        logger.info("Recebendo pagamento de R$ " + amount + " da conta " + fromAccount + 
+                   ": " + description);
         
-        // Realiza a transferência
-        boolean success = driverAccount.transfer(account, amount, description);
+        // Atualiza o saldo da conta local
+        account.deposit(amount,description);
         
-        if (success) {
-            logger.info("Pagamento processado com sucesso. Novo saldo do posto: R$ " + 
-                       account.getBalance());
-        } else {
-            logger.warning("Falha no processamento do pagamento");
-        }
-        
-        return success;
+        logger.info("Pagamento recebido com sucesso. Novo saldo: R$ " + account.getBalance());
+        return true;
     }
     
     /**
-     * Classe interna que representa uma solicitação de abastecimento.
+     * Classe interna para representar mensagens trocadas com o AlphaBank.
      */
-    public static class RefuelRequest implements Serializable {
-        private static final long serialVersionUID = 1L;
-        
-        private final String carId;
-        private final String driverId;
-        private final double amount;
-        private final int fuelType;
-        private final long timestamp;
-        
-        /**
-         * Construtor da solicitação de abastecimento.
-         * 
-         * @param carId ID do carro
-         * @param driverId ID do motorista
-         * @param amount Quantidade de combustível em litros
-         * @param fuelType Tipo de combustível
-         */
-        public RefuelRequest(String carId, String driverId, double amount, int fuelType) {
-            this.carId = carId;
-            this.driverId = driverId;
-            this.amount = amount;
-            this.fuelType = fuelType;
-            this.timestamp = System.currentTimeMillis();
-        }
-        
-        // Getters
-        
-        public String getCarId() {
-            return carId;
-        }
-        
-        public String getDriverId() {
-            return driverId;
-        }
-        
-        public double getAmount() {
-            return amount;
-        }
-        
-        public int getFuelType() {
-            return fuelType;
-        }
-        
-        public long getTimestamp() {
-            return timestamp;
-        }
-    }
-    
-    /**
-     * Classe interna que representa uma mensagem para comunicação com o banco.
-     */
-    public static class BankMessage implements Serializable {
+    private static class BankMessage implements Serializable {
         private static final long serialVersionUID = 1L;
         
         public enum MessageType {
             AUTH, AUTH_OK, AUTH_FAIL,
             BALANCE, BALANCE_RESPONSE,
             TRANSFER, TRANSFER_OK, TRANSFER_FAIL,
-            LOGOUT, ERROR
+            LOGOUT
         }
         
-        private final MessageType type;
-        private final String login;
-        private final String message;
-        private final Object data;
+        private MessageType type;
+        private String login;
+        private String message;
+        private Object data;
         
         public BankMessage(MessageType type, String login, String message, Object data) {
             this.type = type;
@@ -557,7 +511,7 @@ public class FuelStation extends Thread {
         }
     }
     
-    // Getters e Setters
+    // Getters e setters
     
     public String getStationId() {
         return stationId;
@@ -569,14 +523,6 @@ public class FuelStation extends Thread {
     
     public Account getAccount() {
         return account;
-    }
-    
-    public void setAccount(Account account) {
-        this.account = account;
-    }
-    
-    public boolean isRunning() {
-        return running;
     }
     
     public double getDieselPrice() {
@@ -601,17 +547,5 @@ public class FuelStation extends Thread {
     
     public void setEthanolPrice(double ethanolPrice) {
         this.ethanolPrice = ethanolPrice;
-    }
-    
-    public boolean isConnected() {
-        return connected;
-    }
-    
-    public int getAvailablePumps() {
-        return pumpSemaphore.availablePermits();
-    }
-    
-    public int getWaitingCarsCount() {
-        return waitingCars.size();
     }
 }

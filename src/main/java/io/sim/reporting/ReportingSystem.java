@@ -2,19 +2,26 @@ package io.sim.reporting;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList; // Importar
+//import java.util.List;    // Importar
+import java.util.Map;     // Importar
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level; // Importar
+import java.util.logging.Logger; // Importar
+
 
 import io.sim.DrivingData;
-import io.sim.EnvSimulator;
+import io.sim.MobilityCompany; // Importar
 
 /**
  * Classe responsável por integrar os módulos de relatório e gráficos com o simulador.
  * Implementa o padrão Singleton para garantir uma única instância de integração.
  */
-public class ReportingSystem {
+public class ReportingSystem implements MobilityCompany.DrivingDataListener{
     
+    private static final Logger logger = Logger.getLogger(ReportingSystem.class.getName()); // Adicionar logger
     private static ReportingSystem instance;
     
     // Referência para os geradores de relatório e gráficos
@@ -25,7 +32,7 @@ public class ReportingSystem {
     private final ScheduledExecutorService scheduler;
     
     // Diretório base para relatórios e gráficos
-    private String baseDirectory = "/home/ubuntu/reporting/";
+    private String baseDirectory = "reporting/";
     
     // Intervalo para geração automática de relatórios (em minutos)
     private int autoReportInterval = 5;
@@ -33,10 +40,19 @@ public class ReportingSystem {
     // Flag para controle de execução
     private boolean running = false;
     
+    private MobilityCompany mobilityCompany;
+
     /**
      * Construtor privado para implementar o padrão Singleton.
      */
-    private ReportingSystem() {
+    private ReportingSystem(MobilityCompany company) {
+        this.mobilityCompany = company;
+        if (this.mobilityCompany != null) {
+            this.mobilityCompany.addDrivingDataListener(this); // Registra-se como listener
+        } else {
+            logger.warning("ReportingSystem: MobilityCompany não fornecida na inicialização. Gráficos em tempo real podem não funcionar via listener.");
+        }
+
         // Inicializa os geradores
         excelGenerator = ExcelReportGenerator.getInstance();
         chartManager = RealTimeChartManager.getInstance();
@@ -53,13 +69,26 @@ public class ReportingSystem {
      * 
      * @return Instância do ReportingSystem
      */
-    public static synchronized ReportingSystem getInstance() {
+    public static synchronized ReportingSystem getInstance(MobilityCompany company) {
         if (instance == null) {
-            instance = new ReportingSystem();
+            instance = new ReportingSystem(company);
         }
         return instance;
     }
     
+    public void setMobilityCompany(MobilityCompany company) {
+        if (this.mobilityCompany == null && company != null) {
+            this.mobilityCompany = company;
+            this.mobilityCompany.addDrivingDataListener(this);
+            logger.info("ReportingSystem: MobilityCompany definida e listener registrado.");
+        } else if (company == null) {
+            if (this.mobilityCompany != null) {
+                this.mobilityCompany.removeDrivingDataListener(this);
+            }
+            this.mobilityCompany = null;
+        }
+    }
+
     /**
      * Configura os diretórios para relatórios e gráficos.
      */
@@ -145,32 +174,45 @@ public class ReportingSystem {
      * 
      * @param data Dados de condução
      */
-    public void addDrivingData(DrivingData data) {
+    @Override
+    public void onNewDrivingData(DrivingData data) {
         if (data == null || !running) {
             return;
         }
-        
-        // Adiciona os dados ao gerador de relatórios Excel
-        // (O chartManager já recebe os dados via listener)
-        excelGenerator.addDrivingData(data);
+        logger.info("REPORTSYS_ON_NEW_DATA (Listener da MobilityCompany): Recebido DrivingData para Car: " + data.getAutoID() + ", TS: " + data.getTimeStamp() + ". Atualizando ChartManager.");
+        // Atualiza os gráficos em tempo real com o novo dado
+        if (chartManager != null) {
+            chartManager.onNewDrivingData(data);
+        }
     }
     
-    /**
-     * Gera relatórios periódicos.
-     */
     private void generatePeriodicReports() {
         try {
-            // Gera relatório Excel consolidado
-            String excelReport = excelGenerator.generateConsolidatedReport();
-            
-            // Salva os gráficos atuais
+            if (this.mobilityCompany == null) {
+                logger.warning("ReportingSystem: MobilityCompany não disponível para relatórios periódicos.");
+                return;
+            }
+            Map<String, ArrayList<DrivingData>> allData = this.mobilityCompany.getConsolidatedCarDrivingReports();
+
+            if (allData == null || allData.isEmpty()) { // Adicionar verificação de null também
+                logger.info("ReportingSystem: Nenhum dado disponível na MobilityCompany para relatório periódico Excel.");
+            } else {
+                logger.info("ReportingSystem: Gerando relatório Excel periódico com dados de " + allData.size() + " carros.");
+                String excelReport = excelGenerator.generateConsolidatedReport(allData); // Passa os dados
+                logger.info("ReportingSystem: Relatório Excel periódico gerado (ou tentado): " + excelReport);
+            }
+
+            // Para gráficos, saveAllCharts pega os dados das TimeSeries internas do ChartManager
+            logger.info("ReportingSystem: Salvando gráficos periódicos...");
             String[] chartFiles = chartManager.saveAllCharts();
-            
-            System.out.println("Relatórios periódicos gerados com sucesso:");
-            System.out.println("- Excel: " + excelReport);
-            System.out.println("- Gráficos: " + chartFiles.length + " arquivos");
+            for(String chartFile : chartFiles){
+                if(chartFile != null) logger.info("ReportingSystem: Gráfico salvo: " + chartFile);
+            }
+
+        } catch (IllegalArgumentException iae) { 
+            logger.warning("ReportingSystem: Não foi possível gerar relatório periódico: " + iae.getMessage());
         } catch (Exception e) {
-            System.err.println("Erro ao gerar relatórios periódicos: " + e.getMessage());
+            logger.log(Level.SEVERE, "ReportingSystem: Erro ao gerar relatórios periódicos: " + e.getMessage(), e);
         }
     }
     
@@ -180,15 +222,23 @@ public class ReportingSystem {
      * @throws IOException Se ocorrer um erro ao gerar os relatórios
      */
     public void generateFinalReports() throws IOException {
-        // Gera relatório Excel consolidado
-        String excelReport = excelGenerator.generateConsolidatedReport();
-        
-        // Salva os gráficos atuais
-        String[] chartFiles = chartManager.saveAllCharts();
-        
-        System.out.println("Relatórios finais gerados com sucesso:");
-        System.out.println("- Excel: " + excelReport);
-        System.out.println("- Gráficos: " + chartFiles.length + " arquivos");
+    // ... (lógica similar para obter e logar o tamanho de allData) ...
+        Map<String, ArrayList<DrivingData>> allData = mobilityCompany.getConsolidatedCarDrivingReports();
+        if (allData == null || allData.isEmpty()) {
+            logger.warning("ReportingSystem: Não há dados de condução disponíveis da MobilityCompany para gerar relatório Excel final.");
+            // Não lança exceção para permitir que os gráficos (se houver) sejam salvos
+        } else {
+            logger.info("ReportingSystem: Gerando relatório Excel final com dados de " + allData.size() + " carros.");
+            String excelReportPath = excelGenerator.generateConsolidatedReport(allData);
+            logger.info("ReportingSystem: Relatório Excel final gerado (ou tentado): " + excelReportPath);
+        }
+
+        logger.info("ReportingSystem: Salvando gráficos finais...");
+        String[] chartFilePaths = chartManager.saveAllCharts();
+        for(String chartFile : chartFilePaths){
+            if(chartFile != null) logger.info("ReportingSystem: Gráfico final salvo: " + chartFile);
+            else logger.info("ReportingSystem: arquivo nulo: " + chartFile);
+        }
     }
     
     /**

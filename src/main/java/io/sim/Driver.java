@@ -1,5 +1,11 @@
 package io.sim;
 
+import de.tudresden.sumo.cmd.Route;
+import de.tudresden.sumo.cmd.Vehicle;
+import de.tudresden.sumo.objects.SumoStringList;
+import it.polito.appeal.traci.SumoTraciConnection;
+import sim.traci4j.src.java.it.polito.appeal.traci.protocol.Constants; // Para VAR_ROUTE_INDEX
+
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -7,561 +13,460 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.security.PublicKey;
 import java.util.ArrayList;
-import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.logging.Logger;
 import java.util.Base64;
-import org.json.JSONObject;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock; // Se ainda for usar para algo não SUMO
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
-import io.sim.utils.JsonUtil;
+import org.json.JSONObject; // Se for usar para parsear resposta do AlphaBank
+
+import io.sim.utils.JsonUtil; // Se for usar para parsear resposta do AlphaBank
 
 /**
  * Classe que representa um motorista no sistema de simulação.
- * Implementa Thread para execução concorrente e atua como cliente para o AlphaBank.
- * Gerencia um carro e rotas a serem executadas.
+ * Implementa Thread para execução concorrente.
+ * Gerencia um carro, executa rotas sequencialmente no SUMO e atua como cliente para o AlphaBank.
  */
 public class Driver extends Thread {
-    
+
     private static final Logger logger = Logger.getLogger(Driver.class.getName());
-    
-    // Identificação do motorista
+
+    // Identificação
     private final String driverId;
     private final String nome;
-    
-    // Carro associado ao motorista
     private Car car;
-    
-    // Conexão com o AlphaBank
+
+    // Conexão AlphaBank
     private Socket bankConnection;
-    private ObjectOutputStream out;
-    private ObjectInputStream in;
+    private ObjectOutputStream outdriverStream; 
+    private ObjectInputStream indrivStream;  
     private Account account;
-    private boolean connected;
-    
-    // Gerenciamento de rotas
-    private final ArrayList<Rota> rotasAExecutar;
-    private Rota rotaEmExecucao;
+    private boolean connectedToBank; // Renomeado de 'connected'
+    private EncriptaDecriptaDES alphaBankSessionEncryptor; // Renomeado de 'sessionEncryptor'
+
+    // Rotas
+    private final ArrayList<Rota> rotasAExecutarOriginais; // Lista original de rotas
     private final ArrayList<Rota> rotasExecutadas;
-    
-    // Locks para controle de acesso às listas de rotas
+
+    // Locks (avaliar se ainda são necessários com a nova lógica de run())
     private final ReentrantLock lockRotasAExecutar = new ReentrantLock();
-    private final ReentrantLock lockRotaEmExecucao = new ReentrantLock();
     private final ReentrantLock lockRotasExecutadas = new ReentrantLock();
-    
-    // Bot de pagamento para a Fuel Station
+
     private BotPayment botPayment;
-    
-    // Controle de execução
-    private boolean running;
-    private final double FUEL_PRICE_PER_KM = 5.87;
-    
-    // Utilitário de criptografia
-    private EncriptaDecriptaDES sessionEncryptor;
-    private String chaveBanco;
-    
-    /**
-     * Construtor principal do Driver.
-     * 
-     * @param driverId ID do motorista
-     * @param nome Nome do motorista
-     * @param car Carro associado ao motorista
-     * @param bankHost Host do servidor AlphaBank
-     * @param bankPort Porta do servidor AlphaBank
-     * @param login Login para a conta no AlphaBank
-     * @param password Senha para a conta no AlphaBank
-     * @param initialBalance Saldo inicial da conta
-     */
-    public Driver(String driverId, String nome, Car car, 
-                 String bankHost, int bankPort, 
-                 String login, String password, 
-                 double initialBalance) {
+    private AtomicBoolean running = new AtomicBoolean(false);
+    private final double FUEL_PRICE_PER_KM = 5.87; // Exemplo, pode ser do Carro
+
+    // Conexão SUMO e controle de retry para inicialização de rotas
+    private SumoTraciConnection sumo;
+    private int maxRetriesRouteInit = 5;
+    private int initialRetryDelayRouteInitMs = 500;
+
+    private EnvSimulator envSimulator; // Para interagir com o monitor de threads do EnvSimulator
+
+    public Driver(String driverId, String nome, Car car,
+                  String bankHost, int bankPort,
+                  String login, String password,
+                  double initialBalance,
+                  SumoTraciConnection sumo, // ESSENCIAL: Passar a conexão SUMO
+                  EnvSimulator envSimulator) { // Para monitoramento de threads
+        super(driverId); // Nome da Thread
         this.driverId = driverId;
+        this.setName(driverId); // Define o nome da thread
         this.nome = nome;
         this.car = car;
-        this.rotasAExecutar = new ArrayList<>();
+        this.sumo = sumo; // Armazena a conexão SUMO
+        this.envSimulator = envSimulator; // Armazena referência ao EnvSimulator
+
+        this.rotasAExecutarOriginais = new ArrayList<>();
         this.rotasExecutadas = new ArrayList<>();
-        this.rotaEmExecucao = null;
-        this.running = false;
-        this.connected = false;
-        
+        this.running.set(false); // Será definido como true no início do run()
+        this.connectedToBank = false;
+
+        // Cria conta no AlphaBank
+        this.account = new Account(login, password, initialBalance);
+
+        // Conecta ao AlphaBank (a negociação de chave ocorre aqui)
         try {
-            // Inicializa o encriptador
-            this.chaveBanco = "MTIzNDU2Nzg=";
-            this.sessionEncryptor = new EncriptaDecriptaDES(Base64.getDecoder().decode(chaveBanco));
-            
-            // Cria conta no AlphaBank
-            this.account = new Account(login, password, initialBalance);
-            
-            // Conecta ao servidor AlphaBank
-            connectToBank(bankHost, bankPort);
-            
-            // Inicializa o bot de pagamento
-            this.botPayment = new BotPayment(account, bankHost, bankPort);
-            
-            logger.info("Driver " + driverId + " criado com sucesso");
-        } catch (Exception e) {
-            logger.severe("Erro ao criar Driver " + driverId + ": " + e.getMessage());
-        }
-    }
-    
-    /**
-     * Estabelece conexão com o servidor AlphaBank.
-     * 
-     * @param host Host do servidor
-     * @param port Porta do servidor
-     * @throws IOException Se ocorrer um erro de conexão
-     */
-    private void connectToBank(String host, int port) throws IOException {
-        try {
-            logger.info("Iniciando conexão com AlphaBank...");
-            this.bankConnection = new Socket(host, port);
-            // Timeout pode ser útil, mas ajuste conforme necessário
-            // this.bankConnection.setSoTimeout(10000); // 10 segundos de timeout para operações de socket
-
-            logger.info("Socket do Driver criado. Criando streams...");
-            this.out = new ObjectOutputStream(bankConnection.getOutputStream());
-            logger.info("Output Stream Criada. Criando Input stream...");
-            this.out.flush(); // Flush antes de criar ObjectInputStream
-            this.in = new ObjectInputStream(bankConnection.getInputStream());
-
-            // 1. ENVIAR ID DO CLIENTE PARA O SERVIDOR
-            String clientId = this.driverId + "_" + UUID.randomUUID().toString(); // Ou apenas this.driverId se for único
-            logger.info("Enviando ID do cliente: " + clientId);
-            out.writeObject(clientId);
-            out.flush();
-
-            // 2. RECEBER CHAVE PÚBLICA RSA DO SERVIDOR (em Base64)
-            // ESTA É A PRIMEIRA RESPOSTA DO SERVIDOR AGORA
-            String serverRsaPublicKeyBase64 = (String) in.readObject();
-            // O log que você já tem ("Resposta de conexão recebida: MIIB...") mostra que esta linha funciona.
-            // Remova qualquer log que chame isso de "Resposta de conexão" genérica
-            // e adicione um log específico como:
-            logger.info("Chave pública RSA do servidor recebida (Base64).");
-            PublicKey serverRsaPublicKey = EncriptaDecriptaRSA.getPublicKeyFromBase64(serverRsaPublicKeyBase64);
-
-            // 3. GERAR UMA CHAVE DE SESSÃO DES ALEATÓRIA
-            EncriptaDecriptaDES desKeyGenerator = new EncriptaDecriptaDES(); // Construtor padrão gera chave
-            byte[] desSessionKeyBytes = desKeyGenerator.getChaveDESBytes();
-            
-            // Inicializa o sessionEncryptor DESTE CLIENTE com a chave de sessão gerada
-            this.sessionEncryptor = new EncriptaDecriptaDES(desSessionKeyBytes); // sessionEncryptor é um atributo da classe Driver
-            logger.info("Chave DES de sessão gerada.");
-
-            // 4. CRIPTOGRAFAR A CHAVE DE SESSÃO DES COM A CHAVE PÚBLICA RSA DO SERVIDOR
-            byte[] encryptedDesSessionKey = EncriptaDecriptaRSA.criptografarComPublicKey(desSessionKeyBytes, serverRsaPublicKey);
-
-            // 5. ENVIAR A CHAVE DE SESSÃO DES (CRIPTOGRAFADA COM RSA) PARA O SERVIDOR
-            out.writeObject(encryptedDesSessionKey);
-            out.flush();
-            logger.info("Chave DES de sessão criptografada enviada ao servidor.");
-
-            // 6. AGUARDAR CONFIRMAÇÃO DE CONEXÃO SEGURA DO SERVIDOR (CRIPTOGRAFADA COM A CHAVE DES DE SESSÃO)
-            String encryptedConfirmation = (String) in.readObject(); // Servidor envia string Base64 criptografada
-            String confirmationMessage = this.sessionEncryptor.descriptografar(encryptedConfirmation);
-
-            if (!"CONNECTED_SECURELY".equals(confirmationMessage)) {
-                throw new IOException("Falha ao estabelecer conexão segura com o servidor. Resposta de confirmação inválida: " + confirmationMessage);
-            }
-            this.connected = true; // Defina 'connected' aqui
-            logger.info("Driver " + driverId + " conectado de forma segura ao servidor AlphaBank.");
-
-            // Agora, proceda com a autenticação usando a chave de sessão
-            sendAuthenticationRequest(); // Este método deve usar this.sessionEncryptor
-
+            connectToAlphaBank(bankHost, bankPort); // Método renomeado para clareza
         } catch (IOException e) {
-            logger.severe("Erro de IO ao conectar/negociar chave com AlphaBank: " + e.getMessage());
-            throw e; // Re-throw para ser pego pelo construtor do Driver, se necessário
-        } catch (ClassNotFoundException e) {
-            logger.severe("Erro de classe não encontrada durante negociação: " + e.getMessage());
-            throw new IOException("Erro de comunicação (classe não encontrada)", e);
-        } catch (Exception e) { 
-            logger.severe("Exceção geral durante negociação de chave para Driver " + driverId + ": " + e.getMessage());
-            // e.printStackTrace(); // Útil para depuração
-            throw new IOException("Erro na configuração da criptografia ou negociação de chave: " + e.getMessage(), e);
-        }
-    }
-    
-    /**
-     * Envia solicitação de autenticação para o servidor AlphaBank.
-     * 
-     * @throws IOException Se ocorrer um erro de comunicação
-     */
-    private void sendAuthenticationRequest() throws IOException {
-        try {
-            // Cria objeto JSON diretamente com o campo "action" necessário
-            JSONObject authJson = new JSONObject();
-            authJson.put("action", "AUTHENTICATE");
-            authJson.put("login", account.getLogin());
-            authJson.put("password", account.getSenha());
-            authJson.put("clientType", "DRIVER");
-            
-            String authRequest = authJson.toString();
-            logger.info("Enviando requisição de autenticação: " + authRequest);
-            
-            // Criptografa a solicitação
-            String encryptedRequest = sessionEncryptor.criptografar(authRequest);
-            
-            // Envia para o servidor
-            out.writeObject(encryptedRequest);
-            out.flush();
-            
-            // Aguarda resposta
-            String encryptedResponse = (String) in.readObject();
-            String response = sessionEncryptor.descriptografar(encryptedResponse);
-            logger.info("Resposta de autenticação recebida: " + response);
-            
-            // Verifica se a autenticação foi bem-sucedida
-            if (!response.contains("\"status\":\"success\"")) {
-                throw new IOException("Falha na autenticação: " + response);
-            }
-            
-            logger.info("Autenticação bem-sucedida para o Driver " + driverId);
+            logger.log(Level.WARNING, "Driver " + driverId + " falhou ao conectar com AlphaBank na inicialização: " + e.getMessage() + ". Tentará operar sem AlphaBank.");
+            // O Driver pode continuar sem o banco, mas funcionalidades de pagamento falharão.
+            // 'connectedToBank' permanecerá false.
         } catch (Exception e) {
-            logger.severe("Erro na autenticação: " + e.getMessage());
-            throw new IOException("Erro na autenticação", e);
+             logger.log(Level.SEVERE, "Driver " + driverId + " erro não esperado ao conectar com AlphaBank na inicialização: " + e.getMessage(), e);
         }
-    }
-    
-    /**
-     * Método principal da thread.
-     * Gerencia a execução de rotas e a comunicação com o AlphaBank.
-     */
-    @Override
-    public void run() {
-        this.running = true;
-        
-        // Inicia o bot de pagamento
-        this.botPayment.start();
-        
-        logger.info("Driver " + driverId + " iniciado");
-        
-        while (running) {
-            try {
-                // Verifica se há uma rota em execução
-                if (rotaEmExecucao == null) {
-                    // Tenta obter uma nova rota para executar
-                    Rota proximaRota = getNextRota();
-                    
-                    if (proximaRota != null) {
-                        // Inicia a execução da rota
-                        startRota(proximaRota);
-                    }
-                } else {
-                    // Verifica se a rota atual foi concluída
-                    if (isRotaCompleted()) {
-                        // Finaliza a rota atual
-                        finishCurrentRota();
-                        
-                        // Processa pagamento para a Fuel Station
-                        processPaymentForFuelStation();
-                    }
-                }
-                
-                // Verifica se há mensagens do servidor AlphaBank
-                if (connected && bankConnection.getInputStream().available() > 0) {
-                    processServerMessage();
-                }
-                
-                // Pausa para evitar uso excessivo de CPU
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                // Interrupção normal, verifica se deve continuar
-                if (!running) {
-                    break;
-                }
-            } catch (Exception e) {
-                logger.severe("Erro no loop principal do Driver " + driverId + ": " + e.getMessage());
-                
-                // Tenta reconectar em caso de erro de conexão
-                if (e instanceof IOException && connected) {
-                    try {
-                        reconnectToBank();
-                    } catch (Exception reconnectError) {
-                        logger.severe("Falha ao reconectar ao AlphaBank: " + reconnectError.getMessage());
-                    }
-                }
-            }
+
+
+        // Inicializa o bot de pagamento (PRECISA da conta e da conexão SEGURA com o banco)
+        // É importante que o BotPayment também use a chave de sessão negociada se for se comunicar
+        // através da mesma conexão, ou que tenha sua própria negociação.
+        // A implementação atual do BotPayment o faz conectar-se independentemente.
+        if (this.account != null) { // Só cria bot se a conta foi criada
+             this.botPayment = new BotPayment(this.account, bankHost, bankPort); // BotPayment lida com sua própria conexão/autenticação
+        } else {
+            logger.warning("Driver " + driverId + ": Conta AlphaBank não criada, BotPayment não será inicializado.");
         }
-        
-        // Limpa recursos ao encerrar
-        cleanup();
+
+
+        logger.info("Driver " + driverId + " criado.");
     }
-    
-    /**
-     * Obtém a próxima rota a ser executada.
-     * 
-     * @return Próxima rota ou null se não houver rotas disponíveis
-     */
-    private Rota getNextRota() {
+
+    // Método para adicionar rotas ao Driver pelo EnvSimulator
+    public void addRota(Rota r) {
         lockRotasAExecutar.lock();
         try {
-            if (rotasAExecutar.isEmpty()) {
-                return null;
-            }
-            
-            return rotasAExecutar.remove(0);
+            this.rotasAExecutarOriginais.add(r);
         } finally {
             lockRotasAExecutar.unlock();
         }
-    }
-    
-    /**
-     * Inicia a execução de uma rota.
-     * 
-     * @param rota Rota a ser iniciada
-     */
-    private void startRota(Rota rota) {
-        lockRotaEmExecucao.lock();
-        try {
-            // Atribui a rota ao motorista e carro
-            if (rota.assignRota(this.driverId, this.car.getIdCar())) {
-                // Inicia a execução da rota
-                if (rota.startRota()) {
-                    this.rotaEmExecucao = rota;
-                    logger.info("Driver " + driverId + " iniciou a execução da rota " + rota.getIdRota());
-                    
-                    // Aqui poderia ter código para iniciar a navegação no SUMO
-                    // Por exemplo, enviar comandos para o carro seguir a rota
-                } else {
-                    logger.warning("Falha ao iniciar a rota " + rota.getIdRota());
-                    addRotaToExecutadas(rota);
-                }
-            } else {
-                logger.warning("Falha ao atribuir a rota " + rota.getIdRota() + " ao motorista " + driverId);
-                addRotaToExecutadas(rota);
-            }
-        } finally {
-            lockRotaEmExecucao.unlock();
-        }
-    }
-    
-    /**
-     * Verifica se a rota atual foi concluída.
-     * 
-     * @return true se a rota foi concluída, false caso contrário
-     */
-    private boolean isRotaCompleted() {
-        // Esta é uma implementação simplificada
-        // Em um cenário real, verificaria o progresso da rota no SUMO
-        
-        // Simulação: 10% de chance de concluir a rota a cada verificação
-        return Math.random() < 0.1;
-    }
-    
-    /**
-     * Finaliza a rota atual e a move para a lista de rotas executadas.
-     */
-    private void finishCurrentRota() {
-        lockRotaEmExecucao.lock();
-        try {
-            if (rotaEmExecucao != null) {
-                // Marca a rota como concluída
-                rotaEmExecucao.completeRota();
-                
-                // Adiciona os dados de condução do carro à rota
-                for (DrivingData data : car.getDrivingRepport()) {
-                    rotaEmExecucao.addDrivingData(data);
-                }
-                
-                logger.info("Driver " + driverId + " concluiu a rota " + rotaEmExecucao.getIdRota());
-                
-                // Move a rota para a lista de rotas executadas
-                addRotaToExecutadas(rotaEmExecucao);
-                
-                // Limpa a referência à rota em execução
-                rotaEmExecucao = null;
-            }
-        } finally {
-            lockRotaEmExecucao.unlock();
-        }
-    }
-    
-    /**
-     * Adiciona uma rota à lista de rotas executadas.
-     * 
-     * @param rota Rota a ser adicionada
-     */
-    public void addRotaToExecutadas(Rota rota) {
-        lockRotasExecutadas.lock();
-        try {
-            rotasExecutadas.add(rota);
-        } finally {
-            lockRotasExecutadas.unlock();
-        }
-    }
-    
-    /**
-     * Processa o pagamento para a Fuel Station com base na distância percorrida.
-     */
-    private void processPaymentForFuelStation() {
-        lockRotasExecutadas.lock();
-        try {
-            // Obtém a última rota executada
-            if (!rotasExecutadas.isEmpty()) {
-                Rota ultimaRota = rotasExecutadas.get(rotasExecutadas.size() - 1);
-                
-                // Calcula a distância percorrida em km
-                double distanciaKm = ultimaRota.getActualDistance() / 1000.0;
-                
-                // Calcula o valor a pagar (R$ 5,87 por km)
-                double valorPagamento = distanciaKm * FUEL_PRICE_PER_KM;
-                
-                // Processa o pagamento através do BotPayment
-                // Aqui assumimos que existe uma conta da Fuel Station no AlphaBank
-                Account fuelStationAccount = new Account("fuel_station", "fuel_password",0.0);
-                
-                String paymentId = botPayment.processPayment(
-                        fuelStationAccount, 
-                        valorPagamento, 
-                        "Pagamento de combustível - Rota: " + ultimaRota.getIdRota() + " - Distância: " + distanciaKm + " km");
-                
-                if (paymentId != null) {
-                    logger.info("Pagamento de combustível realizado com sucesso: " + paymentId + " - Valor: R$ " + valorPagamento);
-                } else {
-                    logger.warning("Falha no pagamento de combustível para a rota " + ultimaRota.getIdRota());
-                }
-            }
-        } finally {
-            lockRotasExecutadas.unlock();
-        }
-    }
-    
-    /**
-     * Processa mensagens recebidas do servidor AlphaBank.
-     * 
-     * @throws Exception Se ocorrer um erro no processamento
-     */
-    private void processServerMessage() throws Exception {
-        try {
-            // Lê a mensagem criptografada
-            String encryptedMessage = (String) in.readObject();
-            
-            // Descriptografa a mensagem
-            String message = sessionEncryptor.descriptografar(encryptedMessage);
-            
-            logger.info("Mensagem recebida do AlphaBank: " + message);
-            
-            // Aqui seria implementada a lógica para processar diferentes tipos de mensagens
-            // Por exemplo, confirmações de pagamento, notificações, etc.
-        } catch (Exception e) {
-            logger.severe("Erro ao processar mensagem do AlphaBank: " + e.getMessage());
-            throw e;
-        }
-    }
-    
-    /**
-     * Tenta reconectar ao servidor AlphaBank.
-     * 
-     * @throws Exception Se ocorrer um erro na reconexão
-     */
-    private void reconnectToBank() throws Exception {
-        logger.info("Tentando reconectar ao servidor AlphaBank...");
-        
-        // Fecha conexão atual se existir
-        if (bankConnection != null && !bankConnection.isClosed()) {
-            try {
-                bankConnection.close();
-            } catch (IOException e) {
-                // Ignora erros ao fechar
-            }
-        }
-        
-        this.connected = false;
-        
-        // Tenta reconectar
-        String host = bankConnection.getInetAddress().getHostName();
-        int port = bankConnection.getPort();
-        
-        // Reconecta
-        connectToBank(host, port);
-    }
-    
-    /**
-     * Limpa recursos ao encerrar o driver.
-     */
-    private void cleanup() {
-        // Para o bot de pagamento
-        if (botPayment != null) {
-            botPayment.stopBot();
-        }
-        
-        // Fecha conexão com o banco
-        try {
-            if (out != null) out.close();
-            if (in != null) in.close();
-            if (bankConnection != null && !bankConnection.isClosed()) {
-                bankConnection.close();
-            }
-        } catch (IOException e) {
-            logger.severe("Erro ao fechar conexões: " + e.getMessage());
-        }
-        
-        logger.info("Driver " + driverId + " encerrado");
-    }
-    
-    /**
-     * Adiciona uma rota à lista de rotas a executar.
-     * 
-     * @param rota Rota a ser adicionada
-     */
-    public void addRota(Rota rota) {
-        lockRotasAExecutar.lock();
-        try {
-            rotasAExecutar.add(rota);
-            logger.info("Rota " + rota.getIdRota() + " adicionada ao Driver " + driverId);
-        } finally {
-            lockRotasAExecutar.unlock();
-        }
-    }
-    
-    /**
-     * Para a execução do driver.
-     */
-    public void stopDriver() {
-        this.running = false;
-        this.interrupt();
-    }
-    
-    // Getters e setters
-    
-    public String getDriverId() {
-        return driverId;
-    }
-    
-    public String getNome() {
-        return nome;
-    }
-    
-    public Car getCar() {
-        return car;
-    }
-    
-    public void setCar(Car car) {
-        this.car = car;
-    }
-    
-    public Account getAccount() {
-        return account;
     }
     
     public List<Rota> getRotasAExecutar() {
         lockRotasAExecutar.lock();
         try {
-            return new ArrayList<>(rotasAExecutar);
+            // Retorna uma cópia para evitar ConcurrentModificationException se a lista original for modificada
+            return new ArrayList<>(this.rotasAExecutarOriginais);
         } finally {
             lockRotasAExecutar.unlock();
         }
     }
-    
-    public Rota getRotaEmExecucao() {
-        lockRotaEmExecucao.lock();
-        try {
-            return rotaEmExecucao;
-        } finally {
-            lockRotaEmExecucao.unlock();
+
+
+    private void connectToAlphaBank(String host, int bankPort) throws IOException, ClassNotFoundException, Exception {
+        logger.info("Driver " + driverId + " iniciando conexão com AlphaBank em " + host + ":" + bankPort);
+        this.bankConnection = new Socket();
+        this.bankConnection.connect(new InetSocketAddress(host, bankPort), 10000); // 10s timeout
+
+        this.outdriverStream = new ObjectOutputStream(bankConnection.getOutputStream());
+        this.outdriverStream.flush();
+        this.indrivStream = new ObjectInputStream(bankConnection.getInputStream());
+        logger.info("Driver " + driverId + ": Streams AlphaBank criadas.");
+
+        String clientIdForBank = this.driverId + "_bank_" + UUID.randomUUID().toString();
+        this.outdriverStream.writeObject(clientIdForBank);
+        this.outdriverStream.flush();
+
+        String serverRsaPublicKeyBase64 = (String) this.indrivStream.readObject();
+        PublicKey serverRsaPublicKey = EncriptaDecriptaRSA.getPublicKeyFromBase64(serverRsaPublicKeyBase64);
+
+        EncriptaDecriptaDES desKeyGenerator = new EncriptaDecriptaDES();
+        byte[] desSessionKeyBytes = desKeyGenerator.getChaveDESBytes();
+        this.alphaBankSessionEncryptor = new EncriptaDecriptaDES(desSessionKeyBytes);
+
+        byte[] encryptedDesSessionKey = EncriptaDecriptaRSA.criptografarComPublicKey(desSessionKeyBytes, serverRsaPublicKey);
+        this.outdriverStream.writeObject(encryptedDesSessionKey);
+        this.outdriverStream.flush();
+
+        String encryptedConfirmation = (String) this.indrivStream.readObject();
+        String confirmationMessage = this.alphaBankSessionEncryptor.descriptografar(encryptedConfirmation);
+
+        if (!"CONNECTED_SECURELY".equals(confirmationMessage)) {
+            throw new IOException("Falha ao estabelecer conexão segura com AlphaBank. Confirmação inválida: " + confirmationMessage);
+        }
+        this.connectedToBank = true;
+        logger.info("Driver " + driverId + " conectado de forma SEGURA ao AlphaBank.");
+        sendAuthenticationRequestToAlphaBank();
+    }
+
+    private void sendAuthenticationRequestToAlphaBank() throws IOException, Exception {
+        if (!this.connectedToBank || this.alphaBankSessionEncryptor == null) {
+            throw new IOException("Não conectado de forma segura ao AlphaBank para autenticação.");
+        }
+        Map<String, Object> authData = new HashMap<>();
+        authData.put("action", "AUTHENTICATE");
+        authData.put("login", account.getLogin());
+        authData.put("password", account.getSenha());
+        authData.put("clientType", "DRIVER");
+        String authRequest = JsonUtil.toJson(authData);
+
+        String encryptedRequest = this.alphaBankSessionEncryptor.criptografar(authRequest);
+        this.outdriverStream.writeObject(encryptedRequest);
+        this.outdriverStream.flush();
+
+        String encryptedResponse = (String) this.indrivStream.readObject();
+        String response = this.alphaBankSessionEncryptor.descriptografar(encryptedResponse);
+        
+        Map<String, Object> responseMap = JsonUtil.jsonToMap(response);
+        if (responseMap == null || !"success".equals(responseMap.get("status"))) {
+            throw new IOException("Falha na autenticação com AlphaBank: " + response);
+        }
+        logger.info("Driver " + driverId + " autenticado com sucesso no AlphaBank.");
+    }
+
+
+    @Override
+    public void run() {
+        if (!this.connectedToBank && account == null) {
+             logger.severe("Driver " + driverId + " não pode iniciar. Falha na conexão/autenticação inicial com o banco ou conta não criada.");
+             if (envSimulator != null) envSimulator.markThreadTerminated(this.driverId);
+             return;
+        }
+        this.running.set(true);
+
+        // Inicia o BotPayment SE a conexão com o banco foi bem sucedida E o bot foi criado
+        if (this.botPayment != null && this.connectedToBank) {
+            this.botPayment.start();
+        } else if (this.botPayment == null) {
+             logger.warning("Driver " + driverId + ": BotPayment não inicializado.");
+        } else {
+            logger.warning("Driver " + driverId + ": Não conectado ao banco, BotPayment não será iniciado.");
+        }
+
+        logger.info("Driver " + this.driverId + " (Car: " + this.car.getIdCar() + ") processando rotas sequencialmente.");
+        
+        List<Rota> rotasParaProcessar = getRotasAExecutar(); // Pega a lista de rotas
+        boolean isFirstRouteForThisCar = true;
+
+        for (Rota rotaAtual : rotasParaProcessar) {
+            if (!this.running.get()) {
+                logger.info("Driver " + this.driverId + " interrompido antes da rota " + rotaAtual.getIdRota());
+                break;
+            }
+
+            if (envSimulator != null) envSimulator.updateThreadActivity(this.driverId);
+            logger.info("Driver " + this.driverId + " iniciando processamento da rota " + rotaAtual.getIdRota());
+
+            boolean routeInitializedSuccessfully = false;
+            int attempts = 0;
+            int currentRetryDelay = initialRetryDelayRouteInitMs;
+
+            while (attempts < maxRetriesRouteInit && !routeInitializedSuccessfully && this.running.get()) {
+                try {
+                    if (attempts > 0) {
+                        logger.info("Driver " + this.driverId + " (Rota: " + rotaAtual.getIdRota() + ") tentando inicialização novamente (tentativa " + (attempts + 1) + "/" + maxRetriesRouteInit + ")");
+                        Thread.sleep(currentRetryDelay);
+                        currentRetryDelay *= 2;
+                    }
+
+                    if (this.sumo == null || this.sumo.isClosed()) {
+                        throw new Exception("Conexão SUMO está fechada ou nula para Driver " + driverId);
+                    }
+
+                    String vehicleID = this.car.getIdCar();
+                    String routeID = rotaAtual.getIdRota();
+                    SumoStringList edgeList = new SumoStringList();
+                    String[] arestasDaRota = rotaAtual.getRota();
+
+                    if (arestasDaRota == null || arestasDaRota.length == 0) {
+                        throw new Exception("Rota " + routeID + " para Driver " + driverId + " não contém arestas.");
+                    }
+                    for (String edge : arestasDaRota) {
+                        edgeList.add(edge);
+                    }
+                    
+                    // Sincronizar no objeto sumo pode ser uma boa ideia se ele é compartilhado entre threads
+                    // e as operações do Traci4J não são totalmente thread-safe para sequências de comandos.
+                    // A biblioteca Traci4J sincroniza 'exchangeQuery', que é usado por do_job_set/get.
+                    // Vamos assumir por agora que é suficiente.
+                    
+                    logger.info("Driver " + this.driverId + " (Car: " + vehicleID + ") definindo/adicionando rota SUMO: " + routeID);
+                    this.sumo.do_job_set(Route.add(routeID, edgeList));
+
+                    if (isFirstRouteForThisCar) {
+                        // Verifica se o veículo já existe (pode ter sido adicionado por outro meio ou em uma execução anterior não limpa)
+                        SumoStringList existingVehicles = (SumoStringList) this.sumo.do_job_get(Vehicle.getIDList());
+                        if (existingVehicles.contains(vehicleID)) {
+                            logger.warning("Driver " + this.driverId + ": Veículo " + vehicleID + " já existe no SUMO, mas esta é marcada como a primeira rota. Tentando definir rota.");
+                            this.sumo.do_job_set(Vehicle.setRouteID(vehicleID, routeID));
+                        } else {
+                            logger.info("Driver " + this.driverId + " (primeira rota) adicionando veículo: " + vehicleID + " à rota " + routeID);
+                            this.sumo.do_job_set(Vehicle.addFull(vehicleID, routeID, "DEFAULT_VEHTYPE", "now", // ou tipo do carro
+                                                        "0", "0", "0", "current", "max", "current",
+                                                        "", "", "", this.car.getPersonCapacity(), this.car.getPersonNumber()));
+                        }
+                    } else {
+                        logger.info("Driver " + this.driverId + " (rota subsequente) atribuindo rota " + routeID + " ao veículo existente " + vehicleID);
+                        this.sumo.do_job_set(Vehicle.setRouteID(vehicleID, routeID));
+                        // Para garantir que o veículo reinicie corretamente na nova rota:
+                        this.sumo.do_job_set(Vehicle.setSpeed(vehicleID, -1)); 
+                        // this.sumo.do_job_set(Vehicle.resume(vehicleID)); // Se o veículo puder estar "parado" (não apenas fim da rota)
+                    }
+                    this.sumo.do_job_set(Vehicle.setColor(vehicleID, this.car.getColorCar()));
+                    logger.info("Driver " + this.driverId + " (Car: " + vehicleID + ") configurado para rota " + routeID);
+                    routeInitializedSuccessfully = true;
+
+                } catch (InterruptedException e) {
+                    logger.warning("Driver " + this.driverId + " interrompido durante inicialização da rota " + rotaAtual.getIdRota());
+                    Thread.currentThread().interrupt();
+                    this.running.set(false); 
+                    break; 
+                } catch (Exception e) {
+                    attempts++;
+                    logger.log(Level.WARNING, "Driver " + this.driverId + " (Rota: " + rotaAtual.getIdRota() + ") falha na inicialização (tentativa " + attempts + "): " + e.getMessage(), e);
+                    if (this.sumo != null && this.sumo.isClosed()) {
+                        logger.severe("Driver " + this.driverId + " (Rota: " + rotaAtual.getIdRota() + ") conexão SUMO está fechada. Abortando tentativas.");
+                        this.running.set(false);
+                        break; 
+                    }
+                    if (attempts >= maxRetriesRouteInit) {
+                         logger.severe("Driver " + this.driverId + " (Rota: " + rotaAtual.getIdRota() + ") falhou ao inicializar após " + maxRetriesRouteInit + " tentativas.");
+                         this.running.set(false); 
+                    }
+                }
+            }
+
+            if (!routeInitializedSuccessfully || !this.running.get()) {
+                if (this.running.get()) { 
+                     logger.severe("Driver " + this.driverId + " não conseguiu inicializar a rota " + rotaAtual.getIdRota() + ". Parando driver.");
+                     this.running.set(false);
+                }
+                break; 
+            }
+
+            logger.info("Driver " + this.driverId + " (Car: " + this.car.getIdCar() + ") iniciando monitoramento da rota " + rotaAtual.getIdRota());
+            boolean currentRouteStillActive = true;
+            while (currentRouteStillActive && this.running.get()) {
+                try {
+                    if (envSimulator != null) envSimulator.updateThreadActivity(this.driverId);
+
+                    if (this.sumo == null || this.sumo.isClosed()) {
+                        logger.warning("Driver " + this.driverId + " (Rota: " + rotaAtual.getIdRota() + ") - Conexão SUMO fechada durante monitoramento.");
+                        this.running.set(false); 
+                        break;
+                    }
+
+                    String vehicleID = this.car.getIdCar();
+                    SumoStringList currentVehiclesInSim = (SumoStringList) this.sumo.do_job_get(Vehicle.getIDList());
+                    if (currentVehiclesInSim.contains(vehicleID)) {
+                        int routeIndex = (int) this.sumo.do_job_get(Vehicle.getRouteIndex(vehicleID));
+                        if (routeIndex == -1) { 
+                            logger.info("Driver " + this.driverId + " (Car: " + vehicleID + ") completou a rota " + rotaAtual.getIdRota() + " (índice de rota -1).");
+                            currentRouteStillActive = false;
+                        }
+                        // O carro pode ter lógica interna de "drive" que interage com SUMO
+                        if (this.car != null && this.running.get()) {
+                            // Exemplo: this.car.updateStateAndAct(); // Se o carro tiver tal método
+                        }
+                    } else {
+                        logger.info("Driver " + this.driverId + " (Car: " + vehicleID + ") não está mais na simulação (durante rota " + rotaAtual.getIdRota() + "). Rota considerada completa.");
+                        currentRouteStillActive = false;
+                    }
+
+                    if (!currentRouteStillActive) {
+                        rotaAtual.completeRota(); 
+                        this.rotasExecutadas.add(rotaAtual); // Adiciona à lista de executadas
+                        logger.info("Driver " + this.driverId + ": Estado da Rota " + rotaAtual.getIdRota() + " marcado como completo e movido para executadas.");
+                        processPaymentForFuelStation(rotaAtual); // Passa a rota que acabou de ser completada
+                    } else {
+                        Thread.sleep(this.car.getAcquisitionRate()); 
+                    }
+
+                } catch (InterruptedException e) {
+                    logger.warning("Driver " + this.driverId + " interrompido durante monitoramento da rota " + rotaAtual.getIdRota());
+                    Thread.currentThread().interrupt();
+                    this.running.set(false);
+                } catch (it.polito.appeal.traci.TraCIException e) {
+                    String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+                    if (msg.contains(this.car.getIdCar().toLowerCase() + "' does not exist") || msg.contains("is not known")) {
+                        logger.info("Driver " + this.driverId + " (Car: " + this.car.getIdCar() + ") não existe mais no SUMO (exceção TraCI na rota " + rotaAtual.getIdRota() + "). Rota considerada completa.");
+                        currentRouteStillActive = false;
+                        rotaAtual.completeRota();
+                        this.rotasExecutadas.add(rotaAtual);
+                        processPaymentForFuelStation(rotaAtual);
+                    } else {
+                        logger.log(Level.WARNING, "Driver " + this.driverId + " (Rota: " + rotaAtual.getIdRota() + ") erro TraCI durante monitoramento: " + e.getMessage(), e);
+                        this.running.set(false); 
+                    }
+                } catch (Exception e) {
+                    logger.log(Level.WARNING, "Driver " + this.driverId + " (Rota: " + rotaAtual.getIdRota() + ") erro geral durante monitoramento: " + e.getMessage(), e);
+                    this.running.set(false); 
+                }
+            }
+            
+            if (!this.running.get()) { 
+                logger.info("Driver " + this.driverId + " parando após a rota " + rotaAtual.getIdRota());
+                break; 
+            }
+
+            logger.info("Driver " + this.driverId + " (Car: " + this.car.getIdCar() + ") finalizou o processamento da rota " + rotaAtual.getIdRota());
+            isFirstRouteForThisCar = false; 
+        } 
+
+        logger.info("Driver " + this.driverId + " (Car: " + this.car.getIdCar() + ") completou todas as suas rotas ou foi interrompido.");
+        cleanup();
+        if (envSimulator != null) envSimulator.markThreadTerminated(this.driverId);
+        logger.info("Driver " + driverId + " encerrado.");
+    }
+
+    // O método processPaymentForFuelStation original parecia pegar a última rota da lista
+    // rotasExecutadas. Agora é melhor passar a rota que acabou de ser concluída.
+    private void processPaymentForFuelStation(Rota rotaConcluida) {
+        if (botPayment == null || !this.connectedToBank) {
+            logger.warning("Driver " + driverId + " - botPayment indisponível ou não conectado ao banco. Pagamento não processado para rota " + rotaConcluida.getIdRota());
+            return;
+        }
+
+        // Calcula a distância percorrida (rotaConcluida deve ter essa informação)
+        double distanciaPercorridaMetros = rotaConcluida.getActualDistance(); // Supondo que Rota tem este método
+        if (distanciaPercorridaMetros <= 0) {
+            logger.info("Driver " + driverId + ": Distância percorrida na rota " + rotaConcluida.getIdRota() + " foi zero ou inválida. Nenhum pagamento de combustível.");
+            return;
+        }
+        double distanciaKm = distanciaPercorridaMetros / 1000.0;
+        double valorAPagar = distanciaKm * FUEL_PRICE_PER_KM; // FUEL_PRICE_PER_KM deve ser definido
+
+        if (valorAPagar > 0) {
+            logger.info("Driver " + driverId + " processando pagamento de R$" + String.format("%.2f", valorAPagar) + 
+                       " para Fuel Station (Rota: " + rotaConcluida.getIdRota() + ", Distância: " + String.format("%.2f", distanciaKm) + " km)");
+            
+            String paymentId = botPayment.processPayment("fuel_station_account_id", valorAPagar, // Substitua pelo ID real da conta do posto
+                                     "Combustível Rota " + rotaConcluida.getIdRota() + " Car " + this.car.getIdCar());
+            
+            if (paymentId != null) {
+                logger.info("Driver " + driverId + ": Pagamento de combustível para rota " + rotaConcluida.getIdRota() + " processado com sucesso: " + paymentId);
+            } else {
+                logger.warning("Driver " + driverId + ": Falha no processamento do pagamento de combustível para rota " + rotaConcluida.getIdRota());
+            }
         }
     }
+    
+    private void cleanup() {
+        logger.info("Driver " + driverId + " limpando recursos...");
+        if (botPayment != null) {
+            botPayment.stopBot(); // Sinaliza para o bot parar
+            try {
+                botPayment.join(5000); // Espera um pouco pelo bot terminar
+                if (botPayment.isAlive()) {
+                    logger.warning("Driver " + driverId + ": Timeout esperando BotPayment terminar.");
+                }
+            } catch (InterruptedException e) {
+                logger.warning("Driver " + driverId + ": Interrompido enquanto esperava BotPayment terminar.");
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (bankConnection != null && !bankConnection.isClosed()) {
+            try {
+                this.indrivStream.close();
+                this.outdriverStream.close();
+                this.bankConnection.close();
+                this.connectedToBank = false;
+                logger.info("Driver " + driverId + ": Conexão com AlphaBank fechada.");
+            } catch (IOException e) {
+                logger.warning("Driver " + driverId + ": Erro ao fechar conexão com AlphaBank: " + e.getMessage());
+            }
+        }
+         logger.info("Driver " + driverId + " - Recursos liberados");
+    }
+
+    public void stopDriver() {
+        logger.info("Driver " + driverId + " recebendo sinal para parar...");
+        this.running.set(false);
+        this.interrupt(); // Interrompe a thread se estiver em sleep/wait
+    }
+
+    // --- Getters e Setters existentes ---
+    // (Os locks para rotas podem ser simplificados se a modificação da lista de rotas
+    // for feita apenas antes de iniciar a thread do Driver)
+
+    public String getDriverId() { return driverId; }
+    public String getNome() { return nome; }
+    public Car getCar() { return car; }
+    public Account getAccount() { return account; }
     
     public List<Rota> getRotasExecutadas() {
         lockRotasExecutadas.lock();
@@ -571,12 +476,9 @@ public class Driver extends Thread {
             lockRotasExecutadas.unlock();
         }
     }
-    
-    public boolean isConnected() {
-        return connected;
-    }
-    
-    public boolean isRunning() {
-        return running;
-    }
+    // Os métodos getNextRota, startRota, isRotaCompleted, finishCurrentRota
+    // que você tinha antes eram para um modelo de simulação de rota diferente (não SUMO-direto).
+    // Eles não são usados diretamente na nova lógica de run() que controla o SUMO.
+    // Se ainda forem necessários para alguma outra funcionalidade, podem permanecer,
+    // mas não devem interferir na execução das rotas SUMO.
 }

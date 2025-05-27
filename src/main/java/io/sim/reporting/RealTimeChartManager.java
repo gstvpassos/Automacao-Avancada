@@ -37,6 +37,8 @@ import org.jfree.data.xy.XYSeries;
 import org.jfree.data.xy.XYSeriesCollection;
 
 import io.sim.DrivingData;
+import java.util.logging.Logger;
+import java.util.logging.Level;
 
 /**
  * Classe responsável por gerar gráficos em tempo real a partir dos dados de condução.
@@ -44,6 +46,8 @@ import io.sim.DrivingData;
  */
 public class RealTimeChartManager implements ExcelReportGenerator.DrivingDataListener {
     
+     private static final Logger logger = Logger.getLogger(RealTimeChartManager.class.getName()); // Adicionar logger
+   
     private static RealTimeChartManager instance;
     
     // Armazena séries temporais por veículo e tipo de dado
@@ -98,7 +102,7 @@ public class RealTimeChartManager implements ExcelReportGenerator.DrivingDataLis
         }
         
         // Registra-se como listener no ExcelReportGenerator
-        ExcelReportGenerator.getInstance().addDrivingDataListener(this);
+        //ExcelReportGenerator.getInstance().addDrivingDataListener(this);
         
         // Agenda a atualização periódica dos gráficos
         scheduler.scheduleAtFixedRate(this::updateCharts, 1, 1, TimeUnit.SECONDS);
@@ -275,7 +279,7 @@ public class RealTimeChartManager implements ExcelReportGenerator.DrivingDataLis
     /**
      * Atualiza os gráficos com os dados mais recentes.
      */
-    private void updateCharts() {
+    public void updateCharts() {
         SwingUtilities.invokeLater(() -> {
             for (ChartType type : ChartType.values()) {
                 ChartPanel chartPanel = chartPanels.get(type);
@@ -367,7 +371,7 @@ public class RealTimeChartManager implements ExcelReportGenerator.DrivingDataLis
         }
         
         // Remove-se como listener
-        ExcelReportGenerator.getInstance().removeDrivingDataListener(this);
+        //ExcelReportGenerator.getInstance().removeDrivingDataListener(this);
     }
     
     /**
@@ -387,7 +391,15 @@ public class RealTimeChartManager implements ExcelReportGenerator.DrivingDataLis
         
         // Obtém ou cria o mapa de séries para o veículo
         Map<ChartType, TimeSeries> vehicleSeries = timeSeriesMap.computeIfAbsent(
-                vehicleId, k -> new HashMap<>());
+            vehicleId, k -> {
+                logger.info("RealTimeChartManager: Criando novo conjunto de TimeSeries para veículo: " + k);
+                Map<ChartType, TimeSeries> newSeriesMap = new HashMap<>();
+                for (ChartType chartT : ChartType.values()) {
+                    // Cria a série com uma chave única combinando tipo e ID do veículo para a legenda
+                    newSeriesMap.put(chartT, new TimeSeries(chartT.getLabel() + " (" + k + ")"));
+                }
+                return newSeriesMap;
+            });
         
         // Atualiza a série de velocidade
         updateTimeSeries(vehicleSeries, ChartType.SPEED, timestamp, data.getSpeed());

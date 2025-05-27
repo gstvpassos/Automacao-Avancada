@@ -6,7 +6,7 @@ public class DrivingData {
 
 	/* SUMO's data */
 
-	private String autoID;
+	private String carID;
 	private String driverID;
 	private long timeStamp; 			// System.currentTimeMillis()
 	private double x_Position; 			// sumoPosition2D (x)
@@ -138,12 +138,12 @@ public class DrivingData {
 
 	public DrivingData(
 
-			String _autoID, String _driverID, long _timeStamp, double _x_Position, double _y_Position, double[] _latLon,
+			String _carID, String _driverID, long _timeStamp, double _x_Position, double _y_Position, double[] _latLon,
 			String _roadIDSUMO, String _routeIDSUMO, double _speed, double _odometer, double _fuelConsumption,
 			double _averageFuelConsumption, int _fuelType, double _fuelPrice, double _co2Emission, double _HCEmission, int _personCapacity, int _personNumber) {
 
-		this.autoID = _autoID;
-		this.driverID = _autoID;
+		this.carID = _carID;
+		this.driverID = _driverID;
 		this.timeStamp = _timeStamp;
 		this.x_Position = _x_Position;
 		this.y_Position = _y_Position;
@@ -162,6 +162,10 @@ public class DrivingData {
 		this.personNumber = _personNumber;
 
 	}
+
+	public DrivingData() {
+        // Construtor vazio para o Json
+    }
 
 	public double getSpeed() {
 		return this.speed;
@@ -204,7 +208,7 @@ public class DrivingData {
 	}
 
 	public String getAutoID() {
-		return this.autoID;
+		return this.carID;
 	}
 
 	public String getDriverID() {

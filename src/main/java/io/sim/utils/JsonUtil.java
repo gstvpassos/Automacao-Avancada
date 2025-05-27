@@ -11,11 +11,15 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import java.util.logging.Logger;
+import java.util.logging.Level;
+
 /**
  * Classe utilitária para manipulação de JSON usando a biblioteca org.json.
  * Fornece métodos para converter objetos para JSON e vice-versa.
  */
 public class JsonUtil {
+    private static final Logger logger = Logger.getLogger(JsonUtil.class.getName());
 
     /**
      * Converte um objeto para uma String JSON.
@@ -92,6 +96,7 @@ public class JsonUtil {
      */
     public static <T> T fromJson(String jsonString, Class<T> clazz) {
         if (jsonString == null || jsonString.isEmpty()) {
+            System.err.println("JsonUtil.fromJson: String JSON nula ou vazia.");
             return null;
         }
         
@@ -99,7 +104,7 @@ public class JsonUtil {
             JSONObject jsonObject = new JSONObject(jsonString);
             return jsonObjectToClass(jsonObject, clazz);
         } catch (JSONException e) {
-            System.err.println("Erro ao converter JSON para objeto: " + e.getMessage());
+            System.err.println("JsonUtil.fromJson: Erro ao parsear string JSON para JSONObject: " + e.getMessage() + "\nJSON String: " + jsonString);
             return null;
         }
     }
@@ -113,56 +118,91 @@ public class JsonUtil {
      */
     private static <T> T jsonObjectToClass(JSONObject jsonObject, Class<T> clazz) {
         try {
-            // Cria uma nova instância da classe
-            T instance = clazz.getDeclaredConstructor().newInstance();
-            
-            // Obtém todos os campos declarados na classe
-            Field[] fields = clazz.getDeclaredFields();
-            
-            // Itera sobre as chaves do JSONObject
+            T instance = clazz.getDeclaredConstructor().newInstance(); // Funciona pois DrivingData tem construtor vazio
+            Field[] declaredFields = clazz.getDeclaredFields(); // Usar getDeclaredFields para incluir privados
+
             Iterator<String> keys = jsonObject.keys();
             while (keys.hasNext()) {
                 String key = keys.next();
-                
-                // Procura um campo correspondente na classe
-                for (Field field : fields) {
-                    if (field.getName().equals(key)) {
-                        try {
-                            // Torna o campo acessível mesmo se for privado
-                            field.setAccessible(true);
-                            
-                            // Obtém o valor do JSONObject
-                            Object value = jsonObject.get(key);
-                            
-                            // Converte o valor para o tipo do campo, se necessário
-                            if (value instanceof JSONObject && !field.getType().equals(JSONObject.class)) {
-                                // Se o valor é um JSONObject e o campo não é do tipo JSONObject,
-                                // tenta converter para o tipo do campo
-                                value = jsonObjectToClass((JSONObject) value, field.getType());
-                            } else if (value instanceof JSONArray && !field.getType().equals(JSONArray.class)) {
-                                // Se o valor é um JSONArray e o campo não é do tipo JSONArray,
-                                // tenta converter para uma List ou array
-                                if (List.class.isAssignableFrom(field.getType())) {
-                                    value = jsonArrayToList((JSONArray) value, field);
-                                } else if (field.getType().isArray()) {
-                                    // Implementação para arrays seria mais complexa
-                                    // e não está incluída nesta versão simplificada
-                                }
-                            }
-                            
-                            // Define o valor no campo
-                            field.set(instance, value);
-                            break;
-                        } catch (IllegalAccessException | JSONException e) {
-                            System.err.println("Erro ao definir campo " + key + ": " + e.getMessage());
+                Field field = null;
+                try {
+                    field = clazz.getDeclaredField(key); // Obter o campo pelo nome da chave
+                    field.setAccessible(true);
+                    Object valueJson = jsonObject.get(key);
+
+                    if (JSONObject.NULL.equals(valueJson)) {
+                        // Só definir como null se o tipo do campo não for primitivo
+                        if (!field.getType().isPrimitive()) {
+                            field.set(instance, null);
+                        } else {
+                            // Para tipos primitivos, não se pode atribuir null.
+                            // Pode-se deixar o valor padrão do primitivo (ex: 0 para int/double)
+                            // ou lançar um erro/logar, dependendo do comportamento desejado.
+                            logger.warning("JsonUtil: Valor JSON NULO para o campo primitivo '" + key + "' na classe " + clazz.getName());
                         }
+                        continue;
                     }
+
+                    Class<?> fieldType = field.getType();
+
+                    // Conversão explícita para tipos numéricos
+                    if ((fieldType == double.class || fieldType == Double.class) && valueJson instanceof Number) {
+                        field.set(instance, ((Number) valueJson).doubleValue());
+                    } else if ((fieldType == int.class || fieldType == Integer.class) && valueJson instanceof Number) {
+                        field.set(instance, ((Number) valueJson).intValue());
+                    } else if ((fieldType == long.class || fieldType == Long.class) && valueJson instanceof Number) {
+                        field.set(instance, ((Number) valueJson).longValue());
+                    } else if ((fieldType == float.class || fieldType == Float.class) && valueJson instanceof Number) {
+                        field.set(instance, ((Number) valueJson).floatValue());
+                    } 
+                    // Tratamento específico para double[] (como latLon)
+                    else if (fieldType.isArray() && fieldType.getComponentType() == double.class && valueJson instanceof JSONArray) {
+                        JSONArray jsonArray = (JSONArray) valueJson;
+                        double[] doubleArray = new double[jsonArray.length()];
+                        for (int i = 0; i < jsonArray.length(); i++) {
+                            Object item = jsonArray.get(i);
+                            if (item instanceof Number) {
+                                doubleArray[i] = ((Number) item).doubleValue();
+                            } else if (JSONObject.NULL.equals(item)) {
+                                doubleArray[i] = Double.NaN; // Ou outra representação para nulo em array
+                            } else {
+                                logger.warning("JsonUtil: Item não numérico '" + item + "' (tipo: " + item.getClass().getName() + ") encontrado em JSONArray para campo double[] '" + key + "'");
+                                doubleArray[i] = Double.NaN; // Valor padrão para erro
+                            }
+                        }
+                        field.set(instance, doubleArray);
+                    }
+                    // Conversão recursiva para objetos POJO aninhados
+                    else if (valueJson instanceof JSONObject && !fieldType.equals(JSONObject.class) && !Map.class.isAssignableFrom(fieldType)) {
+                        field.set(instance, jsonObjectToClass((JSONObject) valueJson, fieldType));
+                    } 
+                    // Conversão para Listas genéricas (List<Object> ou List<Map<String,Object>>)
+                    else if (valueJson instanceof JSONArray && List.class.isAssignableFrom(fieldType)) {
+                        // O seu método jsonArrayToList já converte JSONObjects internos para Maps
+                        field.set(instance, jsonArrayToList((JSONArray) valueJson));
+                    }
+                    // Atribuição direta para outros tipos (String, Boolean, etc.)
+                    else {
+                        field.set(instance, valueJson);
+                    }
+
+                } catch (NoSuchFieldException e) {
+                    // Campo existe no JSON mas não na classe Java - pode ser ignorado
+                    // logger.fine("JsonUtil: Campo JSON '" + key + "' não encontrado na classe " + clazz.getName() + ", ignorando.");
+                } catch (IllegalArgumentException e) {
+                    Object val = jsonObject.opt(key); // Usar opt para evitar outra JSONException se a chave sumir
+                    String valType = (val == null || JSONObject.NULL.equals(val)) ? "null" : val.getClass().getName();
+                    String fieldTypeName = (field != null) ? field.getType().getName() : "desconhecido";
+                    logger.log(Level.SEVERE, "JsonUtil: Erro de tipo (IllegalArgumentException) ao definir campo '" + key + 
+                                           "' para o valor '" + val + "' (tipo do valor JSON: " + valType + 
+                                           ", tipo do campo Java: " + fieldTypeName + "): " + e.getMessage(), e);
+                } catch (IllegalAccessException | JSONException e) { // Outras exceções de reflexão ou JSON
+                     logger.log(Level.SEVERE, "JsonUtil: Erro ao definir campo '" + key + "' na classe " + clazz.getName() + ": " + e.getMessage(), e);
                 }
-            }
-            
+            } // fim do while (keys.hasNext())
             return instance;
-        } catch (Exception e) {
-            System.err.println("Erro ao criar instância da classe " + clazz.getName() + ": " + e.getMessage());
+        } catch (Exception e) { // Erros como getDeclaredConstructor().newInstance()
+            logger.log(Level.SEVERE, "JsonUtil: Erro GERAL ao criar/popular instância da classe " + clazz.getName() + ": " + e.getMessage(), e);
             return null;
         }
     }
@@ -216,25 +256,25 @@ public class JsonUtil {
      */
     private static Map<String, Object> jsonObjectToMap(JSONObject jsonObject) {
         Map<String, Object> map = new HashMap<>();
-        
         Iterator<String> keys = jsonObject.keys();
         while (keys.hasNext()) {
             String key = keys.next();
             try {
                 Object value = jsonObject.get(key);
-                
                 if (value instanceof JSONObject) {
                     map.put(key, jsonObjectToMap((JSONObject) value));
                 } else if (value instanceof JSONArray) {
                     map.put(key, jsonArrayToList((JSONArray) value));
-                } else {
+                } else if (JSONObject.NULL.equals(value)) {
+                    map.put(key, null);
+                }
+                 else {
                     map.put(key, value);
                 }
             } catch (JSONException e) {
                 System.err.println("Erro ao obter valor para chave " + key + ": " + e.getMessage());
             }
         }
-        
         return map;
     }
 
@@ -246,23 +286,23 @@ public class JsonUtil {
      */
     private static List<Object> jsonArrayToList(JSONArray jsonArray) {
         List<Object> list = new ArrayList<>();
-        
         try {
             for (int i = 0; i < jsonArray.length(); i++) {
                 Object value = jsonArray.get(i);
-                
                 if (value instanceof JSONObject) {
                     list.add(jsonObjectToMap((JSONObject) value));
                 } else if (value instanceof JSONArray) {
-                    list.add(jsonArrayToList((JSONArray) value));
-                } else {
+                    list.add(jsonArrayToList((JSONArray) value)); // Chamada recursiva
+                } else if (JSONObject.NULL.equals(value)) {
+                    list.add(null);
+                }
+                 else {
                     list.add(value);
                 }
             }
         } catch (JSONException e) {
-            System.err.println("Erro ao converter JSONArray para List: " + e.getMessage());
+            System.err.println("Erro ao converter JSONArray para List<Object>: " + e.getMessage());
         }
-        
         return list;
     }
 
@@ -276,7 +316,6 @@ public class JsonUtil {
         if (jsonString == null || jsonString.isEmpty()) {
             return false;
         }
-        
         try {
             new JSONObject(jsonString);
             return true;
@@ -297,11 +336,11 @@ public class JsonUtil {
      * @param indentFactor O fator de indentação (número de espaços).
      * @return A string JSON formatada, ou a string original em caso de erro.
      */
+
     public static String prettyPrint(String jsonString, int indentFactor) {
         if (jsonString == null || jsonString.isEmpty()) {
             return jsonString;
         }
-        
         try {
             if (jsonString.trim().startsWith("{")) {
                 JSONObject jsonObject = new JSONObject(jsonString);
@@ -335,32 +374,21 @@ public class JsonUtil {
         private String type;
         private String content;
         private long timestamp;
-
-        public GenericMessage() {
-            // Construtor vazio necessário para deserialização
-        }
-
+        public GenericMessage() {}
         public GenericMessage(String type, String content) {
             this.type = type;
             this.content = content;
             this.timestamp = System.currentTimeMillis();
         }
-
-        // Getters e Setters
         public String getType() { return type; }
         public void setType(String type) { this.type = type; }
         public String getContent() { return content; }
         public void setContent(String content) { this.content = content; }
         public long getTimestamp() { return timestamp; }
         public void setTimestamp(long timestamp) { this.timestamp = timestamp; }
-
         @Override
         public String toString() {
-            return "GenericMessage{" +
-                   "type='" + type + '\'' +
-                   ", content='" + content + '\'' +
-                   ", timestamp=" + timestamp +
-                   '}';
+            return "GenericMessage{" + "type='" + type + '\'' + ", content='" + content + '\'' + ", timestamp=" + timestamp + '}';
         }
     }
 

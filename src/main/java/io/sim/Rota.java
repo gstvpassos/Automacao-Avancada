@@ -59,51 +59,92 @@ public class Rota implements Serializable {
      */
     public Rota(String _uriRotasXML, String _idRota) {
         this.uriRotaXML = _uriRotasXML;
-        this.idRota = _idRota;
+        this.idRota = _idRota; // Este é o ID da rota para o SUMO. Ex: "route_for_CAR3"
         this.status = RotaStatus.CREATED;
         this.creationTime = System.currentTimeMillis();
         this.drivingDataList = new ArrayList<>();
-        
+        this.rota = new String[0]; // Inicializa com array vazio para evitar NullPointerException
+
         try {
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
             DocumentBuilder builder = factory.newDocumentBuilder();
-            Document doc = builder.parse(this.uriRotaXML);
-            NodeList nList = doc.getElementsByTagName("vehicle");
-            for (int i = 0; i < nList.getLength(); i++) {
-                Node nNode = nList.item(i);
-                if (nNode.getNodeType() == Node.ELEMENT_NODE) {
-                    Element elem = (Element) nNode;
-                    String idRotaAux = this.idRota;
-                    Node node = elem.getElementsByTagName("route").item(0);
-                    if (node == null) {
-                        // Tenta com "rota" se "route" não existir
-                        node = elem.getElementsByTagName("rota").item(0);
-                    }
+            Document doc = builder.parse(this.uriRotaXML); // Carrega o arquivo XML inteiro
+
+            // Você precisa de uma lógica para encontrar o elemento <vehicle> específico
+            // associado a este _idRota, ou o elemento <route> específico.
+            // O código atual itera por TODOS os <vehicle> e sobrescreve this.rota.
+            // Se o seu XML de rotas define rotas com um ID, você deve usá-lo.
+            // Exemplo: <route id="rota_CAR3" edges="edge1 edge2 edge3"/>
+            // Ou se a rota está dentro de um <vehicle id="CAR3">
+
+            // ASSUMINDO que o _idRota corresponde a um atributo 'id' de um elemento <vehicle>
+            // E que dentro desse <vehicle> existe um <route edges="...">
+            NodeList vehicleNodeList = doc.getElementsByTagName("vehicle");
+            boolean routeFound = false;
+            for (int i = 0; i < vehicleNodeList.getLength(); i++) {
+                Node vNode = vehicleNodeList.item(i);
+                if (vNode.getNodeType() == Node.ELEMENT_NODE) {
+                    Element vehicleElement = (Element) vNode;
                     
-                    if (node != null) {
-                        Element edges = (Element) node;
-                        this.rota = new String[] { idRotaAux, edges.getAttribute("edges") };
+                    // Se o _idRota é para identificar o VEÍCULO no XML:
+                    // String xmlVehicleId = vehicleElement.getAttribute("id");
+                    // if (!_idRota.equals(xmlVehicleId)) { // Ou alguma outra forma de identificar o veículo certo
+                    //     continue; // Pula para o próximo veículo se não for o que procuramos
+                    // }
+
+                    Node routeNode = vehicleElement.getElementsByTagName("route").item(0);
+                    if (routeNode == null) {
+                        routeNode = vehicleElement.getElementsByTagName("rota").item(0);
+                    }
+
+                    if (routeNode != null && routeNode.getNodeType() == Node.ELEMENT_NODE) {
+                        Element routeElement = (Element) routeNode;
+                        String edgesAttribute = routeElement.getAttribute("edges");
+
+                        if (edgesAttribute != null && !edgesAttribute.trim().isEmpty()) {
+                            // Divide a string de arestas (ex: "edge1 edge2 edge3") 
+                            // em um array de IDs de arestas individuais.
+                            this.rota = edgesAttribute.trim().split("\\s+"); // Divide por um ou mais espaços
+                            routeFound = true;
+                            //System.out.println("Rota " + this.idRota + " carregada com arestas: " + java.util.Arrays.toString(this.rota));
+                            break; // Para após encontrar e processar a rota para o veículo/idRota esperado
+                        } else {
+                            System.err.println("Atributo 'edges' vazio ou não encontrado para a rota dentro do veículo relevante para: " + this.idRota);
+                        }
                     } else {
-                        System.err.println("Elemento 'route' ou 'rota' não encontrado para o veículo " + idRotaAux);
+                        // Este log pode aparecer para veículos no XML que não têm uma rota definida, o que pode ser normal.
+                        // System.err.println("Elemento 'route' ou 'rota' não encontrado para o veículo relevante para: " + this.idRota);
                     }
                 }
             }
 
-            Thread.sleep(100);
-            this.on = true;
+            if (!routeFound) {
+                System.err.println("Nenhuma rota válida encontrada no XML para o idRota: " + this.idRota + " (ou para o veículo associado)");
+            }
+
+            // Thread.sleep(100); // Avalie a necessidade deste sleep
+            this.on = true; // O que 'on' significa? Se a rota não for carregada, 'on' deveria ser true?
 
         } catch (SAXException e) {
-            System.err.println("Erro de SAX ao carregar rota: " + e.getMessage());
+            System.err.println("Erro de SAX ao carregar rota " + this.idRota + ": " + e.getMessage());
             e.printStackTrace();
+            this.on = false;
         } catch (IOException e) {
-            System.err.println("Erro de IO ao carregar rota: " + e.getMessage());
+            System.err.println("Erro de IO ao carregar rota " + this.idRota + ": " + e.getMessage());
             e.printStackTrace();
+            this.on = false;
         } catch (ParserConfigurationException e) {
-            System.err.println("Erro de configuração do parser ao carregar rota: " + e.getMessage());
+            System.err.println("Erro de configuração do parser ao carregar rota " + this.idRota + ": " + e.getMessage());
             e.printStackTrace();
-        } catch (InterruptedException e) {
-            System.err.println("Erro de interrupção ao carregar rota: " + e.getMessage());
+            this.on = false;
+        /*} catch (InterruptedException e) { // Removido se Thread.sleep for removido ou tratado de outra forma
+            System.err.println("Erro de interrupção ao carregar rota " + this.idRota + ": " + e.getMessage());
             e.printStackTrace();
+            this.on = false;*/
+        } catch (Exception e) { // Captura genérica para outros erros inesperados
+            System.err.println("Erro inesperado ao carregar rota " + this.idRota + ": " + e.getMessage());
+            e.printStackTrace();
+            this.on = false;
         }
     }
     

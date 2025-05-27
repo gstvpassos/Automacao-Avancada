@@ -15,16 +15,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import de.tudresden.sumo.objects.SumoColor;
+import de.tudresden.sumo.objects.SumoStringList;
 import io.sim.reporting.ReportingSystem;
+import io.sim.utils.GeoUtils;
 import it.polito.appeal.traci.SumoTraciConnection;
 import sim.traci4j.src.java.it.polito.appeal.traci.Edge;
 import sim.traci4j.src.java.it.polito.appeal.traci.Lane;
-import sim.traci4j.src.java.it.polito.appeal.traci.ReadObjectVarQuery.StringListQ;
-import sim.traci4j.src.java.it.polito.appeal.traci.Repository;
 
 /**
  * Classe responsável por gerenciar o ambiente de simulação.
@@ -35,6 +38,7 @@ public class EnvSimulator extends Thread {
     private static final Logger logger = Logger.getLogger(EnvSimulator.class.getName());
     
     // Constantes de configuração
+    private static final String DEFAULT_SUMO_VEHICLE_TYPE = "DEFAULT_VEHTYPE";
     private int numDrivers = 100;
     private int numCars = 100;
     private int numRoutes = 200;
@@ -76,14 +80,37 @@ public class EnvSimulator extends Thread {
     private FuelStation fuelStation;
     private MobilityCompany mobilityCompany;
     
-    // Lista de motoristas e serviços de transporte
+    // Lista de motoristas
     private List<Driver> drivers;
-    private List<TransportService> transportServices;
     
     // Controle de simulação
     private CountDownLatch simulationCompleteLatch;
-    private boolean simulationRunning = false;
+    private AtomicBoolean simulationRunning = new AtomicBoolean(false);
     private Thread simulationThread;
+    
+    // Mapa para monitorar o estado das threads
+    private ConcurrentHashMap<String, ThreadStatus> threadStatusMap = new ConcurrentHashMap<>();
+    
+    /**
+     * Classe para monitorar o status das threads
+     */
+    private static class ThreadStatus {
+        public String name;
+        public String type;
+        public long lastActive;
+        public boolean isAlive;
+        
+        public ThreadStatus(String name, String type) {
+            this.name = name;
+            this.type = type;
+            this.lastActive = System.currentTimeMillis();
+            this.isAlive = true;
+        }
+        
+        public void updateActivity() {
+            this.lastActive = System.currentTimeMillis();
+        }
+    }
     
     /**
      * Construtor padrão.
@@ -96,9 +123,19 @@ public class EnvSimulator extends Thread {
         // Inicializa o controle de simulação
         this.simulationCompleteLatch = new CountDownLatch(1);
         
-        // Inicializa as listas
+        // Inicializa a lista de motoristas
         this.drivers = new ArrayList<>();
-        this.transportServices = new ArrayList<>();
+        
+        // Configura o logger para mostrar mais detalhes
+        configureLogger();
+    }
+    
+    /**
+     * Configura o logger para mostrar mais detalhes
+     */
+    private void configureLogger() {
+        System.setProperty("java.util.logging.SimpleFormatter.format", 
+                "[%1$tF %1$tT] [%4$-7s] %5$s %n");
     }
     
     /**
@@ -135,7 +172,8 @@ public class EnvSimulator extends Thread {
     public void run() {
         logger.info("Iniciando simulação SUMO com " + numDrivers + " Drivers, " + 
                    numCars + " Cars e " + numRoutes + " Routes");
-        
+        GeoUtils.initialize(); 
+        logger.info("GeoUtils.initialize() chamado a partir do EnvSimulator.");
         try {
             // Inicializa todos os componentes
             initializeComponents();
@@ -162,6 +200,14 @@ public class EnvSimulator extends Thread {
                 mobilityCompany.addRota(rota);
             }
             
+            // Inicia o loop de simulação em uma thread separada
+            // Movido para antes de iniciar os motoristas para garantir que a simulação já esteja rodando
+            startSimulationLoop();
+            logger.info("Loop de simulação iniciado com sucesso");
+            
+            // Pequena pausa para garantir que o loop de simulação esteja rodando
+            Thread.sleep(2000);
+            
             // Cria os carros e motoristas
             drivers = createDriversAndCars();
             
@@ -169,27 +215,15 @@ public class EnvSimulator extends Thread {
             distributeRoutesToDrivers(drivers);
             logger.info("Distribuição de rotas concluída com sucesso");
             
-            // Inicia o loop de simulação em uma thread separada
-            // Movido para antes de iniciar os motoristas para garantir que a simulação já esteja rodando
-            startSimulationLoop();
-            logger.info("Loop de simulação iniciado com sucesso");
-            
-            // Pequena pausa para garantir que o loop de simulação esteja rodando
-            Thread.sleep(1000);
-            
             // Inicia todos os motoristas
             startDrivers(drivers);
             logger.info("Todos os motoristas iniciados com sucesso");
             
-            // Cria e inicia os serviços de transporte para cada rota
-            createAndStartTransportServices();
-            logger.info("Todos os serviços de transporte iniciados com sucesso");
+            // Inicia o monitoramento de threads
+            startThreadMonitoring();
             
             // Aguarda a conclusão de todos os motoristas
             waitForDriversCompletion(drivers);
-            
-            // Aguarda a conclusão de todos os serviços de transporte
-            waitForTransportServicesCompletion();
             
             // Gera relatórios finais
             generateFinalReports();
@@ -205,17 +239,116 @@ public class EnvSimulator extends Thread {
     }
     
     /**
+     * Inicia o monitoramento de threads para detectar deadlocks e threads paradas
+     */
+    private void startThreadMonitoring() {
+        Thread monitorThread = new Thread(() -> {
+            logger.info("Iniciando monitoramento de threads");
+            
+            while (simulationRunning.get()) {
+                try {
+                    // Verifica o estado de todas as threads registradas
+                    for (Map.Entry<String, ThreadStatus> entry : threadStatusMap.entrySet()) {
+                        ThreadStatus status = entry.getValue();
+                        
+                        // Verifica se a thread está inativa por muito tempo (30 segundos)
+                        long inactiveTime = System.currentTimeMillis() - status.lastActive;
+                        if (inactiveTime > 30000 && status.isAlive) {
+                            logger.warning("Thread " + status.name + " (" + status.type + ") está inativa há " + 
+                                          (inactiveTime / 1000) + " segundos");
+                        }
+                    }
+                    
+                    // Verifica se há deadlocks no sistema
+                    ThreadGroup rootGroup = Thread.currentThread().getThreadGroup();
+                    ThreadGroup parentGroup;
+                    while ((parentGroup = rootGroup.getParent()) != null) {
+                        rootGroup = parentGroup;
+                    }
+                    
+                    Thread[] threads = new Thread[rootGroup.activeCount()];
+                    while (rootGroup.enumerate(threads, true) == threads.length) {
+                        threads = new Thread[threads.length * 2];
+                    }
+                    
+                    // Conta threads em BLOCKED ou WAITING state
+                    int blockedCount = 0;
+                    for (Thread t : threads) {
+                        if (t != null) {
+                            Thread.State state = t.getState();
+                            if (state == Thread.State.BLOCKED || state == Thread.State.WAITING) {
+                                blockedCount++;
+                            }
+                        }
+                    }
+                    
+                    // Se muitas threads estão bloqueadas, pode ser um deadlock
+                    if (blockedCount > 10) {
+                        logger.warning("Possível deadlock detectado: " + blockedCount + " threads bloqueadas");
+                    }
+                    
+                    Thread.sleep(5000); // Verifica a cada 5 segundos
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    logger.log(Level.WARNING, "Erro no monitoramento de threads", e);
+                }
+            }
+            
+            logger.info("Monitoramento de threads encerrado");
+        }, "Thread-Monitor");
+        
+        monitorThread.setDaemon(true);
+        monitorThread.start();
+    }
+    
+    /**
+     * Registra uma thread para monitoramento
+     * 
+     * @param id Identificador da thread
+     * @param type Tipo da thread (Driver, Car, TransportService, etc.)
+     */
+    public void registerThread(String id, String type) {
+        threadStatusMap.put(id, new ThreadStatus(id, type));
+    }
+    
+    /**
+     * Atualiza o status de atividade de uma thread
+     * 
+     * @param id Identificador da thread
+     */
+    public void updateThreadActivity(String id) {
+        ThreadStatus status = threadStatusMap.get(id);
+        if (status != null) {
+            status.updateActivity();
+        }
+    }
+    
+    /**
+     * Marca uma thread como encerrada
+     * 
+     * @param id Identificador da thread
+     */
+    public void markThreadTerminated(String id) {
+        ThreadStatus status = threadStatusMap.get(id);
+        if (status != null) {
+            status.isAlive = false;
+        }
+    }
+    
+    /**
      * Inicia o loop de simulação em uma thread separada.
      * Esta thread é responsável por avançar o tempo da simulação no SUMO.
      */
     private void startSimulationLoop() {
         logger.info("Iniciando loop de simulação SUMO");
         
-        simulationRunning = true;
+        simulationRunning.set(true);
         simulationThread = new Thread(() -> {
             try {
                 int step = 0;
-                while (simulationRunning && !sumo.isClosed()) {
+                while (simulationRunning.get() && !sumo.isClosed()) {
                     try {
                         // Avança a simulação em um passo
                         sumo.do_timestep();
@@ -251,6 +384,9 @@ public class EnvSimulator extends Thread {
         simulationThread.setDaemon(true);
         simulationThread.start();
         logger.info("Thread de loop de simulação SUMO iniciada");
+        
+        // Registra a thread para monitoramento
+        registerThread("SUMO-Simulation-Loop", "SimulationLoop");
     }
     
     /**
@@ -259,9 +395,6 @@ public class EnvSimulator extends Thread {
      * @throws Exception Se ocorrer um erro durante a inicialização
      */
     private void initializeComponents() throws Exception {
-        // Inicializa o sistema de relatórios
-        initializeReportingSystem();
-        
         // Inicializa o AlphaBank
         initializeAlphaBank();
         
@@ -281,6 +414,9 @@ public class EnvSimulator extends Thread {
         
         // Inicializa a empresa de mobilidade
         initializeMobilityCompany();
+
+        // Inicializa o sistema de relatórios
+        initializeReportingSystem();
     }
     
     /**
@@ -288,7 +424,13 @@ public class EnvSimulator extends Thread {
      */
     private void initializeReportingSystem() {
         logger.info("Inicializando sistema de relatórios");
-        reportingSystem = ReportingSystem.getInstance();
+        // Garanta que mobilityCompany já foi inicializada ANTES de chamar getInstance do ReportingSystem
+        if (this.mobilityCompany == null) {
+            logger.severe("MobilityCompany não inicializada ANTES do ReportingSystem. Abortando inicialização de relatórios.");
+            // Ou lança uma exceção, ou reportingSystem permanecerá nulo.
+            throw new IllegalStateException("MobilityCompany deve ser inicializada antes do ReportingSystem.");
+        }
+        reportingSystem = ReportingSystem.getInstance(this.mobilityCompany); // Passa a MobilityCompany
         reportingSystem.start();
     }
     
@@ -393,6 +535,9 @@ public class EnvSimulator extends Thread {
         fuelStation = new FuelStation("FS001", "Fuel Station", fuelStationAccount);
         fuelStation.start();
         
+        // Registra a thread para monitoramento
+        registerThread("FS001", "FuelStation");
+        
         logger.info("Posto de combustível iniciado com sucesso");
     }
     
@@ -409,6 +554,9 @@ public class EnvSimulator extends Thread {
         mobilityCompany = new MobilityCompany("MC001", companyPort, alphaBank, companyAccount, routeFile);
         mobilityCompany.start();
         
+        // Registra a thread para monitoramento
+        registerThread("MC001", "MobilityCompany");
+        
         logger.info("Empresa de mobilidade iniciada com sucesso na porta " + companyPort);
     }
     
@@ -424,21 +572,14 @@ public class EnvSimulator extends Thread {
         
         try {
             for (int i = 1; i <= numRoutes; i++) {
-                String routeId = "R" + String.format("%03d", i);
-                Rota rota = new Rota(routeFile, routeId);
+                Rota rota = new Rota(routeFile, "Rota " + i);
                 
-                // Verifica se a rota é válida
-                if (rota.isOn()) {
-                    routes.add(rota);
-                    logger.fine("Rota " + routeId + " criada com sucesso");
-                } else {
-                    logger.warning("Rota " + routeId + " não é válida e será ignorada");
-                }
+                routes.add(rota);
             }
             
-            logger.info("Total de rotas válidas criadas: " + routes.size());
+            logger.info("Rotas criadas com sucesso: " + routes.size());
         } catch (Exception e) {
-            logger.severe("Erro ao criar rotas: " + e.getMessage());
+            logger.log(Level.SEVERE, "Erro ao criar rotas", e);
         }
         
         return routes;
@@ -448,257 +589,276 @@ public class EnvSimulator extends Thread {
      * Cria os motoristas e carros para a simulação.
      * 
      * @return Lista de motoristas criados
-     * @throws Exception Se ocorrer um erro ao criar os motoristas e carros
      */
-    private List<Driver> createDriversAndCars() throws Exception {
+    private List<Driver> createDriversAndCars() {
         logger.info("Criando " + numDrivers + " motoristas e " + numCars + " carros");
-        
         List<Driver> driversList = new ArrayList<>();
-        
-        for (int i = 1; i <= numDrivers; i++) {
-            String driverId = "D" + String.format("%03d", i);
-            String driverName = "Driver " + i;
-            String login = "driver" + i;
-            String senha = "pass" + i;
-            
-            // Cria o carro para o motorista
-            String carId = "CAR" + String.format("%03d", i);
-            SumoColor carColor = CAR_COLORS[random.nextInt(CAR_COLORS.length)];
-            int fuelTypeIndex = random.nextInt(FUEL_TYPES.length);
-            int fuelType = FUEL_TYPES[fuelTypeIndex];
-            int fuelPreferential = fuelType;
-            double fuelPrice = FUEL_PRICES[fuelTypeIndex];
-            int personCapacity = random.nextInt(4) + 1;
-            int personNumber = random.nextInt(personCapacity) + 1;
-            int acquisitionRate = 500;
-            
-            try {
-                // Cria o carro com os parâmetros necessários para o Vehicle
-                Car car = new Car(
-                        dis, dos, repoEdge, repoLane,
-                        true, carId, carColor, driverId, sumo, acquisitionRate,
-                        fuelType, fuelPreferential, fuelPrice, personCapacity, personNumber
-                );
-                
-                // Configura o sistema de relatórios no carro
-                car.setReportingSystem(reportingSystem);
-                
-                // Configura o posto de combustível no carro
-                car.setFuelStation(fuelStation);
-                
-                // Cria o motorista
-                Driver driver = new Driver(
-                        driverId, driverName, car, bankHost, bankPort, login, senha, initialBalance
-                );
-                
-                // Adiciona o motorista à lista
-                driversList.add(driver);
-                
-                logger.fine("Motorista " + driverId + " e carro " + carId + " criados com sucesso");
-            } catch (Exception e) {
-                logger.severe("Erro ao criar motorista " + driverId + " e carro: " + e.getMessage());
-                throw e;
+        List<String> availableSumoRouteIDs = new ArrayList<>();
+
+        try {
+            // Obter IDs de rotas que o SUMO realmente conhece (sejam de arquivos XML ou adicionadas via TraCI)
+            // Isso é crucial para o Vehicle.add funcionar.
+            // Se você adiciona rotas dinamicamente ao SUMO, certifique-se que isso aconteça ANTES daqui.
+            if (sumo != null && !sumo.isClosed()) {
+                availableSumoRouteIDs = (List<String>) sumo.do_job_get(de.tudresden.sumo.cmd.Route.getIDList());
+                if (availableSumoRouteIDs.isEmpty()) {
+                    logger.severe("NENHUMA ROTA carregada ou definida no SUMO. Não é possível adicionar veículos dinamicamente sem rotas válidas.");
+                    // Você pode querer lançar uma exceção aqui ou ter rotas padrão definidas em XML.
+                    // Por exemplo, adicione uma rota de emergência/padrão se nenhuma for encontrada:
+                    // ArrayList<String> edges = new ArrayList<>(); edges.add("edge1"); edges.add("edge2"); // Use edges válidos do seu mapa
+                    // sumo.do_job_set(de.tudresden.sumo.cmd.Route.add("default_route_for_cars", edges));
+                    // availableSumoRouteIDs = (List<String>) sumo.do_job_get(de.tudresden.sumo.cmd.Route.getIDList());
+                    // if (availableSumoRouteIDs.isEmpty()) throw new RuntimeException("Falha ao criar/obter rota padrão no SUMO.");
+                } else {
+                    logger.info("Rotas disponíveis no SUMO: " + availableSumoRouteIDs);
+                }
+            } else {
+                logger.severe("SUMO não conectado ao tentar criar carros.");
+                return driversList; // Retorna lista vazia
             }
+
+            for (int i = 1; i <= numCars; i++) { // Alterado para numCars, assumindo 1 carro por motorista
+                String driverId = "D" + String.format("%03d", i);
+                String carId = "CAR" + String.format("%03d", i);
+                SumoColor carColor = CAR_COLORS[random.nextInt(CAR_COLORS.length)];
+
+                // --- INÍCIO DA MODIFICAÇÃO: Adicionar veículo ao SUMO explicitamente ---
+                try {
+                    if (availableSumoRouteIDs.isEmpty()) {
+                        logger.severe("Impossível adicionar " + carId + ": Nenhuma rota disponível no SUMO.");
+                        continue; // Pula a criação deste carro/motorista
+                    }
+                    // Seleciona uma rota do SUMO. Pode ser necessário uma lógica mais sofisticada.
+                    String initialRouteID = availableSumoRouteIDs.get( (i-1) % availableSumoRouteIDs.size() ); 
+                    
+                    // Verifica se o tipo de veículo existe no SUMO
+                    // SumoStringList vehicleTypes = (SumoStringList) sumo.do_job_get(de.tudresden.sumo.cmd.VehicleType.getIDList());
+                    // if (!vehicleTypes.contains(DEFAULT_SUMO_VEHICLE_TYPE)) {
+                    //     logger.warning("Tipo de veículo padrão '" + DEFAULT_SUMO_VEHICLE_TYPE + "' não encontrado no SUMO. " +
+                    //                    "O carro " + carId + " pode não ser adicionado corretamente ou usará um fallback do SUMO.");
+                    //     // Considere adicionar o vType via TraCI se ele não existir:
+                    //     // sumo.do_job_set(de.tudresden.sumo.cmd.VehicleType.copy("DEFAULT_VEHTYPE", "new_type_id"));
+                    //     // sumo.do_job_set(de.tudresden.sumo.cmd.VehicleType.setLength("new_type_id", 5.0)); // Exemplo
+                    // }
+
+                    // Adiciona o veículo ao SUMO
+                    // Parâmetros para Vehicle.add: vehID, typeID, routeID, depart (tempo em s), pos (double), speed (double), lane (byte)
+                    // depart = -3 (triggered) ou -2 (containerTriggered) são comuns para adição dinâmica.
+                    // Ou um tempo específico. Usar 0 para o início ou um tempo ligeiramente futuro.
+                    // int departTimeSeconds = (int) (sumo.do_job_get(de.tudresden.sumo.cmd.Simulation.getCurrentTime()) / 1000.0); // Tempo atual em segundos
+                    int departTime = 0; // Para depart="triggered", o tempo é simbólico, mas SUMO pode precisar que a simulação avance.
+                                        // Usar depart=0 (ou um valor pequeno como 1) se "triggered" não funcionar como esperado.
+                                        // O valor -3 para depart em Vehicle.add(vehID, routeID, typeID, depart,...) significa "triggered"
+                                        // O método de.tudresden.sumo.cmd.Vehicle.add que você tem usa int depart, double pos, double speed, byte lane
+                                        // Este parece ser um comando mais antigo/específico da biblioteca.
+                                        // O padrão TraCI é (string vehID, string routeID, string typeID, string depart, string departLane, string departPos, string departSpeed, ...)
+
+                    logger.info("Tentando adicionar " + carId + " ao SUMO com tipo " + DEFAULT_SUMO_VEHICLE_TYPE +
+                                " na rota " + initialRouteID + ".");
+                    
+                    sumo.do_job_set(de.tudresden.sumo.cmd.Vehicle.add(
+                        carId,                       // vehID
+                        DEFAULT_SUMO_VEHICLE_TYPE,   // typeID
+                        initialRouteID,              // routeID
+                        i,                           // depart (em segundos - vamos escalonar a partida)
+                        0.0,                         // departPos (posição na primeira aresta)
+                        0.0,                         // departSpeed (velocidade inicial)
+                        (byte) 0                     // departLane (índice 0, ou use "first")
+                    ));
+                    logger.info("Comando para adicionar " + carId + " ao SUMO enviado.");
+
+                } catch (Exception eAdd) {
+                    logger.log(Level.SEVERE, "Falha ao adicionar veículo " + carId + " ao SUMO: " + eAdd.getMessage(), eAdd);
+                    continue; // Pula para o próximo carro se este não puder ser adicionado
+                }
+
+                // Cria o Carro
+                Car car = new Car(
+                    new DataInputStream(new ByteArrayInputStream(new byte[0])), // Placeholder para dis
+                    new DataOutputStream(new ByteArrayOutputStream()),           // Placeholder para dos
+                    repoEdge, // Precisa ser inicializado e passado
+                    repoLane, // Precisa ser inicializado e passado
+                    true, carId, carColor, driverId, this.sumo,
+                    1000, // acquisitionRate (exemplo)
+                    FUEL_TYPES[random.nextInt(FUEL_TYPES.length)], 
+                    FUEL_TYPES[random.nextInt(FUEL_TYPES.length)], 
+                    FUEL_PRICES[random.nextInt(FUEL_PRICES.length)],
+                    4, 1 // personCapacity, personNumber
+                );
+                // carsList.add(car); // Se você mantiver uma lista de carros no EnvSimulator
+
+                // Conecta o Carro à MobilityCompany
+                try {
+                    String companyHost = "localhost"; // Ou sua configuração
+                    int companyPort = this.companyPort; 
+                    logger.info("EnvSimulator: Conectando Car " + car.getIdCar() + " à MobilityCompany em " + companyHost + ":" + companyPort);
+                    car.connectToCompany(companyHost, companyPort); // O Car tem este método
+                    
+                    // ***** INICIA A THREAD DO CARRO AQUI *****
+                    if (car.isConnected()) { // Só inicia se conectou com sucesso
+                        logger.info("EnvSimulator: Iniciando thread para Car " + car.getIdCar());
+                        car.start(); // Chama o método start() da classe Car
+                    } else {
+                        logger.warning("EnvSimulator: Car " + car.getIdCar() + " não conectou à Company, thread do carro não será iniciada.");
+                        // Decida o que fazer: o Driver ainda é criado? A simulação continua?
+                        // Se o carro não puder enviar dados, talvez não deva participar.
+                    }
+
+                } catch (IOException e) {
+                    logger.log(Level.SEVERE, "EnvSimulator: Falha crítica ao conectar Car " + car.getIdCar() + " à MobilityCompany. " + e.getMessage(), e);
+                    // O carro não será iniciado se a conexão falhar aqui.
+                } catch (Exception eCar) {
+                    logger.log(Level.SEVERE, "EnvSimulator: Falha geral ao configurar ou conectar Car " + car.getIdCar() + ". " + eCar.getMessage(), eCar);
+                }
+
+                // Cria o Driver
+                String login = "driver" + i;
+                String password = "pass" + i;
+                Driver driver = new Driver(
+                    driverId, "Driver " + i, car,
+                    bankHost, bankPort,
+                    login, password,
+                    initialBalance,
+                    this.sumo,
+                    this // Passa a instância do EnvSimulator para monitoramento
+                );
+                
+                driversList.add(driver);
+                registerThread(driverId, "Driver"); 
+                // Não precisa registrar Car aqui se ele não interage com o sistema de monitoramento do EnvSimulator
+                // ou se o Driver o fizer (mas Driver não tem referência ao EnvSimulator no código atual)
+            }
+            logger.info("Motoristas e carros criados com sucesso: " + driversList.size());
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Erro ao criar motoristas e carros", e);
         }
-        
-        logger.info("Total de " + driversList.size() + " motoristas e carros criados com sucesso");
         return driversList;
+    }
+    
+    /**
+     * Distribui as rotas para os motoristas.
+     * 
+     * @param drivers Lista de motoristas
+     */
+    private void distributeRoutesToDrivers(List<Driver> drivers) {
+        logger.info("Distribuindo rotas para os motoristas");
+        
+        try {
+            // Obtém todas as rotas da empresa
+            List<Rota> allRoutes = mobilityCompany.getAvailableRotas();
+            
+            if (allRoutes.isEmpty()) {
+                logger.warning("Nenhuma rota disponível para distribuição");
+                return;
+            }
+            
+            // Calcula quantas rotas cada motorista deve receber
+            int totalDrivers = drivers.size();
+            int totalRoutes = allRoutes.size();
+            int baseRoutesPerDriver = totalRoutes / totalDrivers;
+            int remainingRoutes = totalRoutes % totalDrivers;
+            
+            logger.info("Total de rotas: " + totalRoutes + ", Total de motoristas: " + totalDrivers);
+            logger.info("Rotas base por motorista: " + baseRoutesPerDriver + ", Rotas restantes: " + remainingRoutes);
+            
+            // Distribui as rotas de forma determinística
+            int routeIndex = 0;
+            for (int i = 0; i < totalDrivers; i++) {
+                Driver driver = drivers.get(i);
+                
+                // Cada motorista recebe pelo menos baseRoutesPerDriver rotas
+                int routesForThisDriver = baseRoutesPerDriver;
+                
+                // Alguns motoristas recebem uma rota adicional para distribuir as restantes
+                if (i < remainingRoutes) {
+                    routesForThisDriver++;
+                }
+                
+                // Adiciona as rotas ao motorista
+                for (int j = 0; j < routesForThisDriver && routeIndex < totalRoutes; j++) {
+                    Rota rota = allRoutes.get(routeIndex++);
+                    driver.addRota(rota);
+                    logger.info("Rota " + rota.getIdRota() + " adicionada ao Driver " + driver.getDriverId());
+                }
+            }
+            
+            // Verifica se todas as rotas foram distribuídas
+            if (routeIndex < totalRoutes) {
+                logger.warning("Nem todas as rotas foram distribuídas: " + routeIndex + "/" + totalRoutes);
+            } else {
+                logger.info("Todas as rotas foram distribuídas com sucesso: " + routeIndex + "/" + totalRoutes);
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Erro ao distribuir rotas", e);
+        }
     }
     
     /**
      * Inicia todos os motoristas.
      * 
-     * @param driversList Lista de motoristas
+     * @param drivers Lista de motoristas
      */
-    private void startDrivers(List<Driver> driversList) {
-        logger.info("Iniciando " + driversList.size() + " motoristas");
+    private void startDrivers(List<Driver> drivers) {
+        logger.info("Iniciando " + drivers.size() + " motoristas");
         
-        for (Driver driver : driversList) {
-            try {
+        try {
+            int count = 0;
+            for (Driver driver : drivers) {
                 // Inicia o motorista
                 driver.start();
+                count++;
                 
-                // Pequeno delay para evitar sobrecarga
-                Thread.sleep(50);
-                
-                logger.fine("Motorista " + driver.getDriverId() + " iniciado com sucesso");
-            } catch (Exception e) {
-                logger.warning("Erro ao iniciar motorista " + driver.getDriverId() + ": " + e.getMessage());
-            }
-        }
-        
-        logger.info("Todos os motoristas iniciados com sucesso");
-    }
-    
-    /**
-     * Cria e inicia os serviços de transporte para cada rota.
-     */
-    private void createAndStartTransportServices() {
-        logger.info("Criando e iniciando serviços de transporte");
-        
-        int servicesCreated = 0;
-        int servicesStarted = 0;
-        
-        // Cria um serviço de transporte para cada par carro/rota
-        for (Driver driver : drivers) {
-            Car car = driver.getCar();
-            List<Rota> driverRoutes = driver.getRotasAExecutar();
-            
-            if (driverRoutes.isEmpty()) {
-                logger.warning("Motorista " + driver.getDriverId() + " não tem rotas para executar");
-                continue;
-            }
-            
-            for (Rota rota : driverRoutes) {
-                try {
-                    // Cria um ID único para o serviço
-                    String tsId = "TS_" + car.getIdCar() + "_" + rota.getIdRota();
-                    
-                    // Cria o serviço de transporte
-                    TransportService ts = new TransportService(true, tsId, rota, car, sumo);
-                    
-                    // Adiciona à lista de serviços
-                    transportServices.add(ts);
-                    servicesCreated++;
-                    
-                    // Inicia o serviço
-                    ts.start();
-                    servicesStarted++;
-                    
-                    // Pequeno delay para evitar sobrecarga
-                    try {
-                        Thread.sleep(50);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                    
-                    logger.fine("Serviço de transporte " + tsId + " iniciado para carro " + car.getIdCar() + " e rota " + rota.getIdRota());
-                } catch (Exception e) {
-                    logger.warning("Erro ao criar serviço de transporte para carro " + car.getIdCar() + " e rota " + rota.getIdRota() + ": " + e.getMessage());
+                // Log a cada 10 motoristas para não sobrecarregar o log
+                if (count % 10 == 0) {
+                    logger.info(count + " motoristas iniciados");
                 }
-            }
-        }
-        
-        logger.info("Total de " + servicesCreated + " serviços de transporte criados e " + servicesStarted + " iniciados");
-    }
-    
-    /**
-     * Distribui as rotas para os motoristas.
-     * Implementação corrigida para evitar loops infinitos.
-     * 
-     * @param driversList Lista de motoristas
-     */
-    private void distributeRoutesToDrivers(List<Driver> driversList) {
-        logger.info("Distribuindo rotas para os motoristas");
-        
-        // Obtém as rotas da empresa
-        List<Rota> availableRoutes = mobilityCompany.getAvailableRotas();
-        
-        if (availableRoutes.isEmpty()) {
-            logger.warning("Não há rotas disponíveis para distribuir");
-            return;
-        }
-        
-        int totalRoutes = availableRoutes.size();
-        logger.info("Total de rotas disponíveis para distribuição: " + totalRoutes);
-        
-        // Embaralha as rotas para distribuição aleatória
-        Collections.shuffle(availableRoutes);
-        
-        // Distribuição determinística para evitar loops infinitos
-        // Cada motorista recebe pelo menos 1 rota, e as rotas restantes são distribuídas sequencialmente
-        int routesPerDriver = Math.max(1, totalRoutes / driversList.size());
-        int remainingRoutes = totalRoutes % driversList.size();
-        
-        logger.info("Cada motorista receberá pelo menos " + routesPerDriver + " rotas, com " + 
-                   remainingRoutes + " motoristas recebendo uma rota adicional");
-        
-        int routeIndex = 0;
-        for (int i = 0; i < driversList.size(); i++) {
-            Driver driver = driversList.get(i);
-            
-            // Número de rotas para este motorista
-            int routesForThisDriver = routesPerDriver + (i < remainingRoutes ? 1 : 0);
-            
-            // Atribui as rotas ao motorista
-            for (int j = 0; j < routesForThisDriver && routeIndex < totalRoutes; j++) {
-                Rota rota = availableRoutes.get(routeIndex);
-                driver.addRota(rota);
-                routeIndex++;
                 
-                logger.info("Rota " + rota.getIdRota() + " atribuída ao motorista " + driver.getDriverId());
+                // Pequena pausa para evitar sobrecarga
+                Thread.sleep(100);
             }
-        }
-        
-        // Verifica se todas as rotas foram distribuídas
-        if (routeIndex < totalRoutes) {
-            logger.warning("Nem todas as rotas foram distribuídas. Distribuindo as " + 
-                          (totalRoutes - routeIndex) + " rotas restantes sequencialmente.");
             
-            // Distribui as rotas restantes sequencialmente
-            int driverIndex = 0;
-            while (routeIndex < totalRoutes) {
-                Driver driver = driversList.get(driverIndex % driversList.size());
-                Rota rota = availableRoutes.get(routeIndex);
-                driver.addRota(rota);
-                routeIndex++;
-                driverIndex++;
-                
-                logger.info("Rota adicional " + rota.getIdRota() + " atribuída ao motorista " + driver.getDriverId());
-            }
+            logger.info("Todos os motoristas iniciados com sucesso: " + count);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.log(Level.SEVERE, "Interrompido durante a inicialização dos motoristas", e);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Erro ao iniciar motoristas", e);
         }
-        
-        // Registra a distribuição de rotas
-        int totalRoutesDistributed = 0;
-        for (Driver driver : driversList) {
-            int driverRoutes = driver.getRotasAExecutar().size();
-            totalRoutesDistributed += driverRoutes;
-            logger.info("Motorista " + driver.getDriverId() + " recebeu " + driverRoutes + " rotas");
-        }
-        
-        logger.info("Distribuição de rotas concluída. Total de " + totalRoutesDistributed + " rotas distribuídas.");
     }
     
     /**
      * Aguarda a conclusão de todos os motoristas.
      * 
-     * @param driversList Lista de motoristas
+     * @param drivers Lista de motoristas
      */
-    private void waitForDriversCompletion(List<Driver> driversList) {
-        logger.info("Aguardando a conclusão de todos os motoristas");
+    private void waitForDriversCompletion(List<Driver> drivers) {
+        logger.info("Aguardando a conclusão de " + drivers.size() + " motoristas");
         
-        // Usa o método join para aguardar a conclusão de todos os motoristas
-        for (Driver driver : driversList) {
-            try {
-                driver.join();
-                logger.fine("Motorista " + driver.getDriverId() + " concluído");
-            } catch (InterruptedException e) {
-                logger.warning("Interrupção ao aguardar o motorista " + driver.getDriverId());
-                Thread.currentThread().interrupt();
+        try {
+            for (Driver driver : drivers) {
+                try {
+                    // Define um timeout para evitar espera infinita
+                    driver.join(60000); // 60 segundos de timeout
+                    
+                    // Verifica se o motorista ainda está vivo após o timeout
+                    if (driver.isAlive()) {
+                        logger.warning("Timeout ao aguardar o Driver " + driver.getDriverId() + ". Continuando...");
+                    } else {
+                        logger.info("Driver " + driver.getDriverId() + " concluído");
+                        
+                        // Marca a thread como encerrada no monitoramento
+                        markThreadTerminated(driver.getDriverId());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    logger.warning("Interrompido ao aguardar o Driver " + driver.getDriverId());
+                }
             }
+            
+            logger.info("Todos os motoristas concluídos ou com timeout");
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Erro ao aguardar motoristas", e);
         }
-        
-        logger.info("Todos os motoristas concluídos");
-    }
-    
-    /**
-     * Aguarda a conclusão de todos os serviços de transporte.
-     */
-    private void waitForTransportServicesCompletion() {
-        logger.info("Aguardando a conclusão de todos os serviços de transporte");
-        
-        // Usa o método join para aguardar a conclusão de todos os serviços
-        for (TransportService ts : transportServices) {
-            try {
-                ts.join();
-                logger.fine("Serviço de transporte " + ts.getIdTransportService() + " concluído");
-            } catch (InterruptedException e) {
-                logger.warning("Interrupção ao aguardar o serviço de transporte " + ts.getIdTransportService());
-                Thread.currentThread().interrupt();
-            }
-        }
-        
-        logger.info("Todos os serviços de transporte concluídos");
     }
     
     /**
@@ -708,9 +868,17 @@ public class EnvSimulator extends Thread {
         logger.info("Gerando relatórios finais");
         
         try {
-            reportingSystem.generateFinalReports();
-            logger.info("Relatórios finais gerados com sucesso");
-        } catch (IOException e) {
+            // Aqui seria implementada a lógica para gerar relatórios finais
+            // Por exemplo, relatórios de consumo de combustível, distância percorrida, etc.
+            
+            // Exemplo: gerar relatório de consumo de combustível
+            if (reportingSystem != null) {
+                reportingSystem.generateFinalReports();
+                logger.info("Relatórios finais gerados com sucesso");
+            } else {
+                logger.warning("Sistema de relatórios não inicializado");
+            }
+        } catch (Exception e) {
             logger.log(Level.SEVERE, "Erro ao gerar relatórios finais", e);
         }
     }
@@ -719,87 +887,81 @@ public class EnvSimulator extends Thread {
      * Encerra todos os serviços.
      */
     private void shutdownServices() {
-        logger.info("Encerrando todos os serviços");
+        logger.info("Encerrando serviços");
         
-        // Encerra o loop de simulação
-        simulationRunning = false;
-        if (simulationThread != null && simulationThread.isAlive()) {
-            simulationThread.interrupt();
-            try {
-                simulationThread.join(5000); // Aguarda até 5 segundos
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        try {
+            // Encerra o loop de simulação
+            simulationRunning.set(false);
+            if (simulationThread != null && simulationThread.isAlive()) {
+                try {
+                    simulationThread.join(5000); // 5 segundos de timeout
+                    if (simulationThread.isAlive()) {
+                        logger.warning("Timeout ao encerrar o loop de simulação. Interrompendo...");
+                        simulationThread.interrupt();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
-        }
-        
-        // Encerra todos os serviços de transporte
-        for (TransportService ts : transportServices) {
-            ts.setOn_off(false);
-        }
-        
-        // Encerra o sistema de relatórios
-        if (reportingSystem != null) {
-            reportingSystem.stop();
-        }
-        
-        // Encerra o posto de combustível
-        if (fuelStation != null) {
-            fuelStation.stopStation();
-            try {
-                fuelStation.join();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            
+            // Encerra o SUMO
+            if (sumo != null && !sumo.isClosed()) {
+                try {
+                    sumo.close();
+                    logger.info("SUMO encerrado com sucesso");
+                } catch (Exception e) {
+                    logger.log(Level.WARNING, "Erro ao encerrar SUMO", e);
+                }
             }
-        }
-        
-        // Encerra a empresa de mobilidade
-        if (mobilityCompany != null) {
-            mobilityCompany.stopServer(); // Método correto para encerrar o servidor
-            try {
-                mobilityCompany.join();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            
+            // Encerra o AlphaBank
+            if (alphaBank != null) {
+                try {
+                    alphaBank.stopServer();
+                    logger.info("AlphaBank encerrado com sucesso");
+                } catch (Exception e) {
+                    logger.log(Level.WARNING, "Erro ao encerrar AlphaBank", e);
+                }
             }
-        }
-        
-        // Encerra o AlphaBank
-        if (alphaBank != null) {
-            alphaBank.stopServer();
-            try {
-                alphaBank.join();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            
+            // Encerra a MobilityCompany
+            if (mobilityCompany != null) {
+                try {
+                    mobilityCompany.stopServer();
+                    logger.info("MobilityCompany encerrada com sucesso");
+                } catch (Exception e) {
+                    logger.log(Level.WARNING, "Erro ao encerrar MobilityCompany", e);
+                }
             }
-        }
-        
-        // Encerra a conexão com o SUMO
-        if (sumo != null && !sumo.isClosed()) {
-            try {
-                logger.info("Fechando conexão com o SUMO");
-                sumo.close();
-                logger.info("Conexão com o SUMO fechada com sucesso");
-            } catch (Exception e) {
-                logger.log(Level.WARNING, "Erro ao fechar conexão com o SUMO", e);
+            
+            // Encerra o sistema de relatórios
+            if (reportingSystem != null) {
+                try {
+                    reportingSystem.stop();
+                    logger.info("Sistema de relatórios encerrado com sucesso");
+                } catch (Exception e) {
+                    logger.log(Level.WARNING, "Erro ao encerrar sistema de relatórios", e);
+                }
             }
+            
+            // Libera o latch para indicar que a simulação foi concluída
+            simulationCompleteLatch.countDown();
+            
+            logger.info("Todos os serviços encerrados com sucesso");
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Erro ao encerrar serviços", e);
         }
-        
-        logger.info("Todos os serviços encerrados com sucesso");
     }
     
     /**
-     * Sinaliza que a simulação foi concluída.
-     */
-    public void signalSimulationComplete() {
-        simulationCompleteLatch.countDown();
-    }
-    
-    /**
-     * Obtém o sistema de relatórios.
+     * Aguarda a conclusão da simulação.
      * 
-     * @return Sistema de relatórios
+     * @param timeout Tempo máximo de espera em milissegundos
+     * @return true se a simulação foi concluída, false se ocorreu timeout
+     * @throws InterruptedException Se a thread for interrompida durante a espera
      */
-    public ReportingSystem getReportingSystem() {
-        return reportingSystem;
+    public boolean waitForCompletion(long timeout) throws InterruptedException {
+        return simulationCompleteLatch.await(timeout, TimeUnit.MILLISECONDS);
     }
     
     /**
@@ -812,85 +974,47 @@ public class EnvSimulator extends Thread {
     }
     
     /**
-     * Obtém a lista de serviços de transporte.
+     * Obtém a conexão com o SUMO.
      * 
-     * @return Lista de serviços de transporte
+     * @return Conexão com o SUMO
      */
-    public List<TransportService> getTransportServices() {
-        return transportServices;
+    public SumoTraciConnection getSumo() {
+        return sumo;
     }
     
-    // Getters e setters para os parâmetros de configuração
-    
-    public int getNumDrivers() {
-        return numDrivers;
+    /**
+     * Obtém o AlphaBank.
+     * 
+     * @return AlphaBank
+     */
+    public AlphaBank getAlphaBank() {
+        return alphaBank;
     }
     
-    public void setNumDrivers(int numDrivers) {
-        this.numDrivers = numDrivers;
+    /**
+     * Obtém o posto de combustível.
+     * 
+     * @return Posto de combustível
+     */
+    public FuelStation getFuelStation() {
+        return fuelStation;
     }
     
-    public int getNumCars() {
-        return numCars;
+    /**
+     * Obtém a empresa de mobilidade.
+     * 
+     * @return Empresa de mobilidade
+     */
+    public MobilityCompany getMobilityCompany() {
+        return mobilityCompany;
     }
     
-    public void setNumCars(int numCars) {
-        this.numCars = numCars;
-    }
-    
-    public int getNumRoutes() {
-        return numRoutes;
-    }
-    
-    public void setNumRoutes(int numRoutes) {
-        this.numRoutes = numRoutes;
-    }
-    
-    public String getRouteFile() {
-        return routeFile;
-    }
-    
-    public void setRouteFile(String routeFile) {
-        this.routeFile = routeFile;
-    }
-    
-    public String getBankHost() {
-        return bankHost;
-    }
-    
-    public void setBankHost(String bankHost) {
-        this.bankHost = bankHost;
-    }
-    
-    public int getBankPort() {
-        return bankPort;
-    }
-    
-    public void setBankPort(int bankPort) {
-        this.bankPort = bankPort;
-    }
-    
-    public int getCompanyPort() {
-        return companyPort;
-    }
-    
-    public void setCompanyPort(int companyPort) {
-        this.companyPort = companyPort;
-    }
-    
-    public int getSumoPort() {
-        return sumoPort;
-    }
-    
-    public void setSumoPort(int sumoPort) {
-        this.sumoPort = sumoPort;
-    }
-    
-    public double getInitialBalance() {
-        return initialBalance;
-    }
-    
-    public void setInitialBalance(double initialBalance) {
-        this.initialBalance = initialBalance;
+    /**
+     * Obtém o sistema de relatórios.
+     * 
+     * @return Sistema de relatórios
+     */
+    public ReportingSystem getReportingSystem() {
+        return reportingSystem;
     }
 }

@@ -10,12 +10,20 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.logging.Level; 
+import java.util.logging.Logger;
+import sim.traci4j.src.java.it.polito.appeal.traci.protocol.Constants;
+
+import io.sim.reporting.ExcelReportGenerator.DrivingDataListener;
+import io.sim.utils.JsonUtil;
 
 /**
  * Classe que representa uma empresa de mobilidade que gerencia carros e rotas.
  * Atua como um servidor para receber conexões dos carros e processar dados de condução.
  */
 public class MobilityCompany extends Thread {
+    private static final Logger logger = Logger.getLogger(MobilityCompany.class.getName()); 
+
     private String companyId;
     private int serverPort; // Porta para escutar conexões dos Carros
     private ServerSocket serverSocket;
@@ -36,12 +44,19 @@ public class MobilityCompany extends Thread {
     // Mapa para armazenar os carros conectados (ID do carro -> Socket)
     private Map<String, Socket> carConnections;
     // Mapa para armazenar os streams de saída para cada carro (ID do carro -> ObjectOutputStream)
-    private Map<String, ObjectOutputStream> carOutputStreams;
+    //private Map<String, ObjectOutputStream> carOutputStreams;
     // Mapa para armazenar os relatórios de condução de cada carro (ID do carro -> Lista de DrivingData)
     private Map<String, ArrayList<DrivingData>> carDrivingReports;
     // Mapa para associar carros às suas rotas atuais (ID do carro -> Rota)
     private Map<String, Rota> carRotaMap;
     
+    // NOVOS Atributos para criptografia
+    private EncriptaDecriptaRSA rsaHandlerCompany; // Renomeado para evitar conflito se houver outro rsaHandler
+    private Map<String, EncriptaDecriptaDES> carSessionEncryptors;
+
+    // Para notificar listeners de gráficos em tempo real
+    private List<DrivingDataListener> drivingDataListeners = new ArrayList<>();
+
     /**
      * Construtor da classe MobilityCompany.
      * 
@@ -62,14 +77,20 @@ public class MobilityCompany extends Thread {
         this.rotasEmExecucao = new ArrayList<>();
         this.rotasExecutadas = new ArrayList<>();
         this.carConnections = new HashMap<>();
-        this.carOutputStreams = new HashMap<>();
-        this.carDrivingReports = new HashMap<>();
+        this.carDrivingReports = new HashMap<>(); // Onde os dados são acumulados
         this.carRotaMap = new HashMap<>();
-        
-        // Inicializa o pool de threads para lidar com conexões de carros
+        this.carSessionEncryptors = new HashMap<>();
+
         this.carClientExecutorService = Executors.newCachedThreadPool();
         
-        // Carrega as rotas do arquivo XML
+        try {
+            this.rsaHandlerCompany = new EncriptaDecriptaRSA();
+            logger.info("MobilityCompany " + companyId + " RSA KeyPair gerado.");
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "MobilityCompany " + companyId + " falha ao gerar RSA KeyPair.", e);
+            throw new RuntimeException("Falha ao inicializar RSA para MobilityCompany", e);
+        }
+        
         carregarRotas();
     }
     
@@ -106,39 +127,58 @@ public class MobilityCompany extends Thread {
         }
     }
     
+    // Interface para listener de DrivingData (para gráficos em tempo real)
+    public interface DrivingDataListener {
+        void onNewDrivingData(DrivingData data);
+    }
+
+    public void addDrivingDataListener(DrivingDataListener listener) {
+        if (listener != null && !this.drivingDataListeners.contains(listener)) {
+            this.drivingDataListeners.add(listener);
+        }
+    }
+
+    public void removeDrivingDataListener(DrivingDataListener listener) {
+        this.drivingDataListeners.remove(listener);
+    }
+
+    private void notifyDrivingDataListeners(DrivingData data) {
+        for (DrivingDataListener listener : this.drivingDataListeners) {
+            try {
+                listener.onNewDrivingData(data);
+            } catch (Exception e) {
+                logger.log(Level.WARNING, "Erro ao notificar listener de DrivingData: " + e.getMessage(), e);
+            }
+        }
+    }
+
     /**
      * Método principal da thread que inicia o servidor e aguarda conexões dos carros.
      */
     @Override
     public void run() {
         try {
-            // Inicializa o servidor socket
             serverSocket = new ServerSocket(serverPort);
             running = true;
-            System.out.println("[MobilityCompany " + companyId + "] Servidor iniciado na porta " + serverPort);
+            logger.info("[MobilityCompany " + companyId + "] Servidor iniciado na porta " + serverPort);
             
-            // Loop principal para aceitar conexões
             while (running) {
                 try {
-                    // Aguarda uma nova conexão
                     Socket clientSocket = serverSocket.accept();
-                    
-                    // Processa a conexão em uma thread separada
                     carClientExecutorService.execute(() -> handleCarConnection(clientSocket));
-                    
                 } catch (IOException e) {
                     if (running) {
-                        System.err.println("[MobilityCompany " + companyId + "] Erro ao aceitar conexão: " + e.getMessage());
+                        logger.log(Level.WARNING, "[MobilityCompany " + companyId + "] Erro ao aceitar conexão de Carro: " + e.getMessage());
                     }
                 }
             }
         } catch (IOException e) {
-            System.err.println("[MobilityCompany " + companyId + "] Erro ao iniciar servidor: " + e.getMessage());
+            logger.log(Level.SEVERE, "[MobilityCompany " + companyId + "] Erro CRÍTICO ao iniciar servidor: " + e.getMessage(), e);
         } finally {
-            stopServer();
+            stopServer(); // Garante que o servidor seja parado
         }
     }
-    
+       
     /**
      * Manipula uma conexão de carro.
      * 
@@ -147,65 +187,143 @@ public class MobilityCompany extends Thread {
     private void handleCarConnection(Socket clientSocket) {
         ObjectInputStream in = null;
         ObjectOutputStream out = null;
-        String carId = null;
-        
+        String registeredCarId = null;
+        EncriptaDecriptaDES carSessionDecryptor = null;
+        String logPrefix = "COMPANY_HANDLER (" + clientSocket.getRemoteSocketAddress() + "): ";
+
         try {
-            // Configura streams de entrada e saída
             out = new ObjectOutputStream(clientSocket.getOutputStream());
+            out.flush(); 
             in = new ObjectInputStream(clientSocket.getInputStream());
+            logger.info(logPrefix + "Streams criadas.");
+
+            // 1. RECEBER REGISTRO JSON DO CARRO
+            logger.info(logPrefix + "Aguardando mensagem de registro JSON...");
+            String registrationJson = (String) in.readObject();
+            logger.info(logPrefix + "Mensagem de registro JSON recebida: " + registrationJson);
             
-            // Recebe o ID do carro
-            carId = (String) in.readObject();
-            System.out.println("[MobilityCompany " + companyId + "] Carro conectado: " + carId);
-            
-            // Registra a conexão
-            synchronized (carConnections) {
-                carConnections.put(carId, clientSocket);
-                carOutputStreams.put(carId, out);
-                carDrivingReports.put(carId, new ArrayList<>());
+            Car.CarRegistration carInfo = JsonUtil.fromJson(registrationJson, Car.CarRegistration.class);
+
+            if (carInfo == null || carInfo.getCarId() == null || carInfo.getCarId().trim().isEmpty()) {
+                logger.severe(logPrefix + "Falha ao desserializar CarRegistration ou carId nulo. JSON: " + registrationJson);
+                throw new IOException("Informações de registro do carro inválidas.");
             }
-            
-            // Envia confirmação de conexão
-            out.writeObject("CONNECTED");
+            registeredCarId = carInfo.getCarId();
+            logPrefix = "COMPANY_HANDLER (" + registeredCarId + "): "; // Atualiza prefixo com ID do carro
+            logger.info(logPrefix + "Carro " + registeredCarId + " (Driver: " + carInfo.getDriverId() + ") registrando.");
+
+            // 2. ENVIAR CHAVE PÚBLICA RSA DA COMPANY
+            logger.info(logPrefix + "Preparando para enviar chave pública RSA...");
+            if (this.rsaHandlerCompany == null) throw new IllegalStateException("rsaHandlerCompany da MobilityCompany é nulo!");
+            String rsaPublicKeyBase64 = this.rsaHandlerCompany.getPublicKeyBase64();
+            out.writeObject(rsaPublicKeyBase64);
             out.flush();
+            logger.info(logPrefix + "Chave pública RSA enviada.");
+
+            // 3. RECEBER E DESCRIPTOGRAFAR CHAVE DE SESSÃO DES
+            logger.info(logPrefix + "Aguardando chave de sessão DES criptografada...");
+            byte[] encryptedDesSessionKey = (byte[]) in.readObject();
+            logger.info(logPrefix + "Chave de sessão DES criptografada recebida (tamanho: " + (encryptedDesSessionKey != null ? encryptedDesSessionKey.length : "null") + " bytes).");
+
+            byte[] desSessionKeyBytes = this.rsaHandlerCompany.descriptografarComPrivateKey(encryptedDesSessionKey);
+            logger.info(logPrefix + "Chave de sessão DES descriptografada.");
+            carSessionDecryptor = new EncriptaDecriptaDES(desSessionKeyBytes);
             
-            // Loop para receber dados do carro
-            while (running && !clientSocket.isClosed()) {
-                Object data = in.readObject();
+            synchronized (carSessionEncryptors) {
+                carSessionEncryptors.put(registeredCarId, carSessionDecryptor);
+            }
+            synchronized (carConnections) {
+                carConnections.put(registeredCarId, clientSocket);
+            }
+            synchronized (carDrivingReports) {
+                carDrivingReports.computeIfAbsent(registeredCarId, k -> new ArrayList<>());
+            }
+            logger.info(logPrefix + "Chave de sessão DES estabelecida.");
+
+            // 4. ENVIAR CONFIRMAÇÃO SEGURA
+            String confirmationMessage = "REGISTRATION_SECURE_SUCCESS";
+            logger.info(logPrefix + "Preparando para enviar confirmação segura: " + confirmationMessage);
+            String encryptedConfirmation = carSessionDecryptor.criptografar(confirmationMessage);
+            out.writeObject(encryptedConfirmation);
+            out.flush();
+            logger.info(logPrefix + "Confirmação segura enviada.");
+           
+            // Loop para receber dados de condução criptografados
+            while (running && clientSocket.isConnected() && !clientSocket.isClosed()) {
+                //logger.fine(logPrefix + "Aguardando próximo objeto...");
+                Object receivedObject = in.readObject(); 
                 
-                if (data instanceof DrivingData) {
-                    // Processa dados de condução
-                    processDrivingData(carId, (DrivingData) data);
-                } else if (data instanceof String) {
-                    // Processa comandos
-                    processCommand(carId, (String) data, out);
+                if (receivedObject instanceof String) {
+                    String encryptedDrivingDataJson = (String) receivedObject;
+                    //logger.fine(logPrefix + "String Criptografada recebida (início): " + encryptedDrivingDataJson.substring(0, Math.min(encryptedDrivingDataJson.length(), 30)) + "...");
+                    
+                    String plainDrivingDataJson = carSessionDecryptor.descriptografar(encryptedDrivingDataJson);
+                    //logger.fine(logPrefix + "JSON Descriptografado: " + plainDrivingDataJson);
+                    
+                    DrivingData drivingData = JsonUtil.fromJson(plainDrivingDataJson, DrivingData.class);
+                    
+                    if (drivingData != null) {
+                        if (!registeredCarId.equals(drivingData.getAutoID())) {
+                             logger.warning(logPrefix + "ID do carro no DrivingData (" + drivingData.getAutoID() + 
+                                           ") não corresponde ao ID da sessão (" + registeredCarId + "). Descartando.");
+                             continue; 
+                        }
+                        //logger.fine(logPrefix + "DrivingData desserializado (Timestamp: " + drivingData.getTimeStamp() + "). Chamando processDrivingData...");
+                        processDrivingData(registeredCarId, drivingData); 
+                        notifyDrivingDataListeners(drivingData);      
+                    } else {
+                        logger.warning(logPrefix + "Falha ao desserializar DrivingData de " + registeredCarId + ". JSON (descriptografado): " + plainDrivingDataJson);
+                    }
+                } else {
+                    logger.warning(logPrefix + "Recebido tipo de objeto inesperado: " + receivedObject.getClass().getName());
                 }
             }
-            
+        } catch (java.io.EOFException eofe) {
+            logger.warning(logPrefix + "EOFException durante o handshake: " + eofe.getMessage() + ". Cliente provavelmente fechou a conexão prematuramente ou não enviou o objeto esperado.");
+        } catch (java.net.SocketException se) {
+            logger.info(logPrefix + "SocketException: " + se.getMessage() + " (provavelmente desconexão).");
         } catch (IOException | ClassNotFoundException e) {
-            System.err.println("[MobilityCompany " + companyId + "] Erro na conexão com carro " + 
-                    (carId != null ? carId : "desconhecido") + ": " + e.getMessage());
-        } finally {
-            // Limpa recursos
-            if (carId != null) {
-                synchronized (carConnections) {
-                    carConnections.remove(carId);
-                    carOutputStreams.remove(carId);
-                    // Não removemos os relatórios de condução para manter o histórico
-                }
-                System.out.println("[MobilityCompany " + companyId + "] Carro desconectado: " + carId);
+            logger.log(Level.SEVERE, logPrefix + "IOException ou ClassNotFoundException durante handshake: " + e.getMessage(), e);
+            if (running) {
+                logger.log(Level.WARNING, logPrefix + "Conexão perdida ou erro: " + e.getMessage());
             }
-            
+        } catch (Exception e) { 
+            logger.log(Level.SEVERE, logPrefix + "Erro GERAL inesperado durante handshake: " + e.getMessage(), e);
+        } finally {
+            String finalCarId = (registeredCarId != null) ? registeredCarId : "ClienteDesconhecido@" + clientSocket.getRemoteSocketAddress();
+            logger.info("COMPANY_HANDLER_FINALLY (" + finalCarId + "): Encerrando handler.");
+            String finalCarIdForLog = (registeredCarId != null) ? registeredCarId : clientSocket.getRemoteSocketAddress().toString();
+            logger.info("COMPANY_HANDLER (" + finalCarIdForLog + "): Bloco finally do handshake alcançado.");
+            if (registeredCarId != null) {
+                synchronized (carConnections) {
+                    carConnections.remove(registeredCarId);
+                }
+                synchronized (carSessionEncryptors) {
+                    carSessionEncryptors.remove(registeredCarId);
+                }
+                // Não removemos os carDrivingReports para manter o histórico para relatórios finais
+            }
             try {
                 if (in != null) in.close();
                 if (out != null) out.close();
                 if (clientSocket != null && !clientSocket.isClosed()) clientSocket.close();
-            } catch (IOException e) {
-                System.err.println("[MobilityCompany " + companyId + "] Erro ao fechar conexão: " + e.getMessage());
+            } catch (IOException e) { 
+                 logger.warning("COMPANY_HANDLER_FINALLY (" + finalCarId + "): Erro ao fechar streams/socket: " + e.getMessage());
             }
         }
     }
     
+    public Map<String, ArrayList<DrivingData>> getConsolidatedCarDrivingReports() {
+        synchronized (carDrivingReports) {
+            // Retorna uma cópia profunda para garantir thread-safety e evitar modificação externa
+            Map<String, ArrayList<DrivingData>> defensiveCopy = new HashMap<>();
+            for (Map.Entry<String, ArrayList<DrivingData>> entry : carDrivingReports.entrySet()) {
+                defensiveCopy.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+            }
+            return defensiveCopy;
+        }
+    }
+
     /**
      * Processa dados de condução recebidos de um carro.
      * 
@@ -213,26 +331,16 @@ public class MobilityCompany extends Thread {
      * @param drivingData Dados de condução
      */
     private void processDrivingData(String carId, DrivingData drivingData) {
-        // Adiciona os dados ao relatório do carro
+        String logPrefix = "COMPANY_PROCESS_DATA (" + carId + "): ";
         synchronized (carDrivingReports) {
-            ArrayList<DrivingData> reports = carDrivingReports.get(carId);
-            if (reports != null) {
-                reports.add(drivingData);
-                
-                // Log para depuração
-                System.out.println("[MobilityCompany " + companyId + "] Dados recebidos do carro " + carId + 
-                        ": Velocidade=" + drivingData.getSpeed() + 
-                        ", Consumo=" + drivingData.getFuelConsumption());
-                
-                // Atualiza os dados de condução na rota atual do carro, se houver
-                synchronized (carRotaMap) {
-                    Rota rotaAtual = carRotaMap.get(carId);
-                    if (rotaAtual != null && rotaAtual.getStatus() == Rota.RotaStatus.IN_PROGRESS) {
-                        rotaAtual.addDrivingData(drivingData);
-                    }
-                }
-            }
+            ArrayList<DrivingData> reports = carDrivingReports.computeIfAbsent(carId, k -> {
+                logger.info(logPrefix + "Criando nova lista de relatórios para este carro.");
+                return new ArrayList<>();
+            });
+            reports.add(drivingData);
+            logger.info(logPrefix + "Dados ARMAZENADOS. Total para este carro: " + reports.size() + ". Timestamp: " + drivingData.getTimeStamp());
         }
+        // A notificação aos listeners agora é feita em handleCarConnection após esta chamada.
     }
     
     /**
@@ -479,22 +587,22 @@ public class MobilityCompany extends Thread {
      * @param message Mensagem a ser enviada
      * @return true se a mensagem foi enviada com sucesso, false caso contrário
      */
-    public boolean sendMessageToCar(String carId, Object message) {
-        synchronized (carOutputStreams) {
-            ObjectOutputStream out = carOutputStreams.get(carId);
-            if (out != null) {
-                try {
-                    out.writeObject(message);
-                    out.flush();
-                    return true;
-                } catch (IOException e) {
-                    System.err.println("[MobilityCompany " + companyId + "] Erro ao enviar mensagem para o carro " + carId + ": " + e.getMessage());
-                    return false;
-                }
-            }
-        }
-        return false;
-    }
+    // public boolean sendMessageToCar(String carId, Object message) {
+    //     synchronized (carOutputStreams) {
+    //         ObjectOutputStream out = carOutputStreams.get(carId);
+    //         if (out != null) {
+    //             try {
+    //                 out.writeObject(message);
+    //                 out.flush();
+    //                 return true;
+    //             } catch (IOException e) {
+    //                 System.err.println("[MobilityCompany " + companyId + "] Erro ao enviar mensagem para o carro " + carId + ": " + e.getMessage());
+    //                 return false;
+    //             }
+    //         }
+    //     }
+    //     return false;
+    // }
     
     /**
      * Adiciona uma nova rota para execução.
@@ -621,7 +729,7 @@ public class MobilityCompany extends Thread {
                 }
             }
             carConnections.clear();
-            carOutputStreams.clear();
+            //carOutputStreams.clear();
         }
         
         // Fecha o servidor socket

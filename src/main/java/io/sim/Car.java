@@ -5,10 +5,13 @@ import io.sim.reporting.ReportingSystem;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.math.BigDecimal;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.net.Socket;
+import java.security.PublicKey;
 import java.util.ArrayList;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import de.tudresden.sumo.cmd.Vehicle;
@@ -18,6 +21,7 @@ import sim.traci4j.src.java.it.polito.appeal.traci.Lane;
 import de.tudresden.sumo.objects.SumoColor;
 import de.tudresden.sumo.objects.SumoPosition2D;
 import it.polito.appeal.traci.SumoTraciConnection;
+import java.awt.geom.Point2D;
 import io.sim.utils.JsonUtil;
 import io.sim.utils.GeoUtils;
 
@@ -58,7 +62,7 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
     private boolean connected;
     
     // Sistema de relatórios
-    private ReportingSystem reportingSystem;
+    //private ReportingSystem reportingSystem;
     
     // Tanque de combustível
     private double fuelTank;
@@ -66,10 +70,13 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
     private long refuelingStartTime;
     
     // Dados de condução e relatórios
-    private ArrayList<DrivingData> drivingReport;
+    private ArrayList<DrivingData> drivingReport_LOCAL;
     private SumoPosition2D lastPosition;
-    private double totalDistance;
+    private double totalOdometer;
     private double distanceSinceLastReport;
+
+    // Criptografia dos dados de direção
+    private EncriptaDecriptaDES companySessionEncryptor; // Para criptografia com MobilityCompany
     
     /**
      * Construtor principal do Car.
@@ -116,15 +123,16 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
         this.fuelPrice = _fuelPrice;
         this.personCapacity = _personCapacity;
         this.personNumber = _personNumber;
-        this.drivingReport = new ArrayList<>();
+        this.drivingReport_LOCAL = new ArrayList<>();
         
         // Inicializa o tanque de combustível com 10 litros
         this.fuelTank = INITIAL_FUEL;
         this.refueling = false;
         
         // Inicializa contadores de distância
-        this.totalDistance = 0.0;
+        this.totalOdometer = 0.0;
         this.distanceSinceLastReport = 0.0;
+        this.lastPosition = null;
         
         logger.info("Car " + idCar + " criado com " + INITIAL_FUEL + "L de combustível.");
     }
@@ -137,49 +145,57 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
      * @throws IOException Se ocorrer um erro de conexão
      */
     public void connectToCompany(String host, int port) throws IOException {
+        if (this.connected) {
+            logger.info("Car " + idCar + ": Já conectado à Company.");
+            return;
+        }
         try {
+            logger.info("Car " + idCar + " conectando ao servidor Company em " + host + ":" + port);
             this.companyConnection = new Socket(host, port);
             this.companyOut = new ObjectOutputStream(companyConnection.getOutputStream());
+            this.companyOut.flush();
             this.companyIn = new ObjectInputStream(companyConnection.getInputStream());
-            
-            // Envia mensagem de registro
-            sendRegistrationToCompany();
+            logger.info("Car " + idCar + ": Streams para Company criadas.");
+
+            // 1. REGISTRO INICIAL (envia CarRegistration JSON)
+            CarRegistration registration = new CarRegistration(this.idCar, this.driverID, "CAR_CLIENT");
+            String registrationJson = JsonUtil.toJson(registration);
+            companyOut.writeObject(registrationJson);
+            companyOut.flush();
+            logger.info("Car " + idCar + ": Mensagem de registro JSON enviada: " + registrationJson);
+
+            // 2. RECEBER CHAVE PÚBLICA RSA DA COMPANY
+            String companyRsaPublicKeyBase64 = (String) companyIn.readObject();
+            logger.info("Car " + idCar + ": Chave pública RSA da Company recebida.");
+            PublicKey companyRsaPublicKey = EncriptaDecriptaRSA.getPublicKeyFromBase64(companyRsaPublicKeyBase64);
+
+            // 3. GERAR CHAVE DE SESSÃO DES, CRIPTOGRAFAR E ENVIAR
+            EncriptaDecriptaDES desKeyGenerator = new EncriptaDecriptaDES();
+            byte[] sessionDesKeyBytes = desKeyGenerator.getChaveDESBytes();
+            this.companySessionEncryptor = new EncriptaDecriptaDES(sessionDesKeyBytes);
+
+            byte[] encryptedSessionDesKey = EncriptaDecriptaRSA.criptografarComPublicKey(sessionDesKeyBytes, companyRsaPublicKey);
+            companyOut.writeObject(encryptedSessionDesKey);
+            companyOut.flush();
+            logger.info("Car " + idCar + ": Chave de sessão DES criptografada enviada para Company.");
+
+            // 4. RECEBER CONFIRMAÇÃO SEGURA
+            String encryptedConfirmation = (String) companyIn.readObject();
+            String confirmationMessage = this.companySessionEncryptor.descriptografar(encryptedConfirmation);
+
+            if (!"REGISTRATION_SECURE_SUCCESS".equals(confirmationMessage)) {
+                throw new IOException("Falha no handshake seguro com Company: " + confirmationMessage);
+            }
             
             this.connected = true;
-            logger.info("Car " + idCar + " conectado ao servidor Company");
-        } catch (IOException e) {
-            logger.severe("Erro ao conectar ao servidor Company: " + e.getMessage());
-            throw e;
-        }
-    }
-    
-    /**
-     * Envia mensagem de registro para o servidor Company.
-     * 
-     * @throws IOException Se ocorrer um erro de comunicação
-     */
-    private void sendRegistrationToCompany() throws IOException {
-        try {
-            // Cria objeto de registro
-            String registrationMessage = JsonUtil.toJson(new CarRegistration(
-                    this.idCar, 
-                    this.driverID, 
-                    "CAR"));
-            
-            // Envia para o servidor
-            companyOut.writeObject(registrationMessage);
-            companyOut.flush();
-            
-            // Aguarda resposta
-            String response = (String) companyIn.readObject();
-            
-            // Verifica se o registro foi bem-sucedido
-            if (!response.contains("\"status\":\"success\"")) {
-                throw new IOException("Falha no registro: " + response);
-            }
+            logger.info("Car " + idCar + " conectado de forma SEGURA ao servidor Company.");
+
         } catch (Exception e) {
-            logger.severe("Erro no registro com a Company: " + e.getMessage());
-            throw new IOException("Erro no registro", e);
+            logger.log(Level.SEVERE, "Car " + idCar + ": Erro ao conectar/negociar chave com Company: " + e.getMessage(), e);
+            this.connected = false;
+            this.companySessionEncryptor = null; // Garante que não tentará usar um encriptador inválido
+            if (e instanceof IOException) throw (IOException)e;
+            else throw new IOException("Erro na negociação de chave com Company: " + e.getMessage(), e);
         }
     }
     
@@ -197,9 +213,9 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
      * 
      * @param reportingSystem Sistema de relatórios a ser utilizado
      */
-    public void setReportingSystem(ReportingSystem reportingSystem) {
-        this.reportingSystem = reportingSystem;
-    }
+    // public void setReportingSystem(ReportingSystem reportingSystem) {
+    //     this.reportingSystem = reportingSystem;
+    // }
 	
     /**
      * Define o servidor Company para este carro.
@@ -214,34 +230,149 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
      * Método principal da thread.
      * Gerencia a execução do carro, atualizando sensores e enviando dados.
      */
+    
     @Override
     public void run() {
+        // A conexão com a Company agora deve ser estabelecida ANTES de iniciar a thread do Car
+        if (!this.connected || this.companySessionEncryptor == null) {
+            logger.severe("Car " + idCar + " iniciando run() SEM conexão segura com a Company. Encerrando thread do carro.");
+            this.on_off = false; // Garante que o loop não execute
+        }
+
         while (this.on_off) {
             try {
-                // Verifica se está em processo de abastecimento
                 if (refueling) {
                     handleRefueling();
                 } else {
-                    // Atualiza sensores e envia dados
                     Thread.sleep(this.acquisitionRate);
-                    this.atualizaSensores();
                     
-                    // Envia dados para a Company se estiver conectado
-                    if (connected && companyConnection != null && !companyConnection.isClosed()) {
-                        sendDrivingDataToCompany();
+                    DrivingData newDataPoint = this.atualizaSensoresEObtemDados(); 
+                    
+                    if (newDataPoint != null) { // Se for nulo, o erro já foi logado e on_off possivelmente false
+                        //logger.info("CAR_RUN (" + idCar + "): newDataPoint GERADO, tentando enviar.");
+                        sendSingleDrivingDataToCompany(newDataPoint);
+                    } else {
+                        // Se newDataPoint é null, atualizaSensoresEObtemDados já deve ter lidado com on_off
+                        // logger.warning("CAR_RUN (" + idCar + "): newDataPoint é NULL. Verifique logs anteriores.");
+                        if (!this.on_off) { // Confirma se o carro foi desligado
+                             logger.info("CAR_RUN (" + idCar + "): Carro foi desligado devido a erro anterior na obtenção de dados.");
+                        }
                     }
                 }
             } catch (InterruptedException e) {
                 logger.warning("Car " + idCar + " thread interrompida: " + e.getMessage());
-                break;
-            } catch (Exception e) {
-                logger.severe("Erro na execução do Car " + idCar + ": " + e.getMessage());
-                e.printStackTrace();
+                Thread.currentThread().interrupt();
+                this.on_off = false;
+            } catch (Exception e) { // Captura genérica para erros inesperados no loop principal do Car
+                logger.log(Level.SEVERE, "Erro inesperado na execução do Car " + idCar + ": " + e.getMessage(), e);
+                this.on_off = false; // Desliga o carro em caso de erro grave
             }
         }
-        
-        // Limpa recursos ao encerrar
         cleanup();
+    }
+
+    /**
+     * Atualiza os sensores do carro e coleta dados de condução.
+     */
+    public DrivingData atualizaSensoresEObtemDados() {
+        String logPrefix = "CAR_SENSOR (" + this.idCar + "): ";
+        DrivingData report = null;
+
+        if (this.sumo == null || this.sumo.isClosed()) {
+            logger.warning(logPrefix + "Conexão SUMO fechada ou nula. Desligando carro.");
+            this.on_off = false;
+            return null;
+        }
+
+        try {
+            // Tenta uma operação básica para verificar se o veículo é conhecido
+            // Se esta falhar com "not known", as outras também falharão.
+            sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getSpeed(this.idCar)); // Teste de "conhecimento"
+
+            SumoPosition2D sumoPosition2D = (SumoPosition2D) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getPosition(this.idCar));
+            //Point2D currentAwtPosition = getPosition(); // Este método é da superclasse TraciObject -> Vehicle
+
+            if (sumoPosition2D == null) { // Pode acontecer se o veículo foi removido entre os comandos
+                 logger.warning(logPrefix + "Posição nula do SUMO (veículo pode ter sido removido inesperadamente). Desligando carro.");
+                 this.on_off = false; 
+                 return null;
+            }
+            
+            // Verificação de NaN ou Infinito
+            if (Double.isNaN(sumoPosition2D.x) || Double.isNaN(sumoPosition2D.y) ||
+                Double.isInfinite(sumoPosition2D.x) || Double.isInfinite(sumoPosition2D.y)) {
+                logger.warning(logPrefix + "Posição SUMO (sumoPosition2D) contém NaN ou Infinito. x=" + sumoPosition2D.x + ", y=" + sumoPosition2D.y + ". Desligando carro.");
+                this.on_off = false;
+                return null;
+            }
+
+            double distanceDelta = 0.0;
+            if (lastPosition != null) {
+                distanceDelta = GeoUtils.calculateEuclideanDistance(sumoPosition2D.x, sumoPosition2D.y, lastPosition.x, lastPosition.y);
+                this.totalOdometer += distanceDelta;
+            }
+            this.lastPosition = sumoPosition2D;
+
+            String roadID_fromSUMO = (String) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getRoadID(this.idCar));
+            String routeID_fromSUMO = (String) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getRouteID(this.idCar));
+            double speed_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getSpeed(this.idCar));
+            double odometerFromSUMOForRoute = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getDistance(this.idCar));
+            double fuelConsumptionSim_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getFuelConsumption(this.idCar));
+            double co2Emission_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getCO2Emission(this.idCar));
+            double hcEmission_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getHCEmission(this.idCar));
+
+            double[] geoCoords = GeoUtils.convertToGeo(sumoPosition2D.x, sumoPosition2D.y);
+
+        if (geoCoords == null || Double.isNaN(geoCoords[0]) || Double.isNaN(geoCoords[1])) {
+            logger.warning(logPrefix + "GeoUtils.convertToGeo retornou inválido (null, NaN) para x=" + sumoPosition2D.x + ", y=" + sumoPosition2D.y + ". Desligando carro.");
+            this.on_off = false;
+            return null;
+        }
+
+            double fuelConsumedLiters = convertFuelConsumptionToLiters(fuelConsumptionSim_fromSUMO, this.acquisitionRate);
+            updateFuelTank(fuelConsumedLiters);
+            
+            report = new DrivingData(
+                    this.idCar, this.driverID, System.currentTimeMillis(), 
+                    sumoPosition2D.x, sumoPosition2D.y, 
+                    geoCoords,
+                    roadID_fromSUMO, routeID_fromSUMO, speed_fromSUMO,
+                    odometerFromSUMOForRoute, // Usando seu odômetro calculado
+                    fuelConsumptionSim_fromSUMO, // Valor bruto do SUMO
+                    calculateAverageFuelConsumption(), // Seu cálculo de média
+                    this.fuelType, this.fuelPrice, 
+                    co2Emission_fromSUMO, hcEmission_fromSUMO, 
+                    this.personCapacity, this.personNumber
+            );
+            
+            synchronized(drivingReport_LOCAL) {
+                this.drivingReport_LOCAL.add(report);
+            }
+
+            if (this.fuelTank <= REFUEL_THRESHOLD && !refueling) {
+                startRefueling();
+            }
+            // Não é necessário chamar setSpeedMode aqui em cada passo se não houver mudança.
+            // if (!refueling && !this.sumo.isClosed()) {
+            //     this.sumo.do_job_set(de.tudresden.sumo.cmd.Vehicle.setSpeedMode(this.idCar, 32)); 
+            // }
+
+        } catch (it.polito.appeal.traci.TraCIException e) {
+            String errorMsg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+            if (errorMsg.contains(this.idCar.toLowerCase() + "' is not known") || errorMsg.contains("does not exist")) {
+                logger.warning(logPrefix + "Veículo " + this.idCar + " não (ou não mais) conhecido pelo SUMO. Desligando carro. Erro: " + e.getMessage());
+            } else {
+                logger.log(Level.WARNING, logPrefix + "Erro TraCI ao atualizar sensores: " + e.getMessage(), e);
+            }
+            this.on_off = false; // Importante para parar o loop do carro
+            return null;
+        } catch (Exception e) { // Captura outras exceções
+            logger.log(Level.SEVERE, logPrefix + "Erro GERAL INESPERADO ao atualizar sensores: " + e.getMessage(), e);
+            this.on_off = false; // Desliga o carro em caso de erro grave
+            return null; 
+        }
+        // logger.info(logPrefix + "DrivingData criado para timestamp: " + (report != null ? report.getTimeStamp() : "NULL"));
+        return report;
     }
 
     /**
@@ -252,146 +383,47 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
         t.start();
     }
 
-    /**
-     * Atualiza os sensores do carro e coleta dados de condução.
+        /**
+     * Envia dados de condução para o servidor Company.
      */
-    public void atualizaSensores() {
-        try {
-            if (!this.getSumo().isClosed()) {
-                // Obtém a posição atual
-                SumoPosition2D currentPosition = null;
-                try {
-                    double[] coords = (double[]) sumo.do_job_get(Vehicle.getPosition(this.idCar));
-                    currentPosition = new SumoPosition2D(coords[0], coords[1]);
-                } catch (Exception e) {
-                    logger.warning("Erro ao obter posição do carro " + idCar + ": " + e.getMessage());
-                    return;
-                }
-                
-                // Calcula a distância percorrida desde a última atualização
-                double distanceDelta = 0.0;
-                if (lastPosition != null) {
-                    distanceDelta = calculateDistance(lastPosition, currentPosition);
-                    totalDistance += distanceDelta;
-                    distanceSinceLastReport += distanceDelta;
-                }
-                lastPosition = currentPosition;
-                
-                // Obtém dados do SUMO
-                String roadID = "unknown";
-                String routeID = "unknown";
-                Integer routeIndex = -1;
-                double speed = 0.0;
-                double odometer = 0.0;
-                double fuelConsumption = 0.0;
-                double co2Emission = 0.0;
-                double hcEmission = 0.0;
-                
-                try {
-                    Object roadIDObj = this.sumo.do_job_get(Vehicle.getRoadID(this.idCar));
-                    roadID = (roadIDObj != null) ? (String) roadIDObj : "unknown";
-                    
-                    Object routeIDObj = this.sumo.do_job_get(Vehicle.getRouteID(this.idCar));
-                    routeID = (routeIDObj != null) ? (String) routeIDObj : "unknown";
-                    
-                    Object routeIndexObj = this.sumo.do_job_get(Vehicle.getRouteIndex(this.idCar));
-                    routeIndex = (routeIndexObj != null) ? (Integer) routeIndexObj : -1;
-                    
-                    Object speedObj = sumo.do_job_get(Vehicle.getSpeed(this.idCar));
-                    speed = (speedObj != null) ? (double) speedObj : 0.0;
-                    
-                    Object odometerObj = sumo.do_job_get(Vehicle.getDistance(this.idCar));
-                    odometer = (odometerObj != null) ? (double) odometerObj : 0.0;
-                    
-                    Object fuelConsumptionObj = sumo.do_job_get(Vehicle.getFuelConsumption(this.idCar));
-                    fuelConsumption = (fuelConsumptionObj != null) ? (double) fuelConsumptionObj : 0.0;
-                    
-                    Object co2EmissionObj = sumo.do_job_get(Vehicle.getCO2Emission(this.idCar));
-                    co2Emission = (co2EmissionObj != null) ? (double) co2EmissionObj : 0.0;
-                    
-                    Object hcEmissionObj = sumo.do_job_get(Vehicle.getHCEmission(this.idCar));
-                    hcEmission = (hcEmissionObj != null) ? (double) hcEmissionObj : 0.0;
-                } catch (Exception e) {
-                    logger.warning("Erro ao obter dados do SUMO para o carro " + idCar + ": " + e.getMessage());
-                }
-                
-                System.out.println("AutoID: " + this.getIdCar());
-                System.out.println("RoadID: " + roadID);
-                System.out.println("RouteID: " + routeID);
-                System.out.println("RouteIndex: " + routeIndex);
-                
-                // Converte coordenadas para geográficas
-                double[] geoCoords = GeoUtils.convertToGeo(currentPosition.x, currentPosition.y);
-                double lon = geoCoords[0];
-                double lat = geoCoords[1];
-                
-                // Atualiza o consumo de combustível
-                // Converte de mg/s para litros considerando o tempo desde a última atualização
-                double fuelConsumedLiters = convertFuelConsumptionToLiters(fuelConsumption, this.acquisitionRate);
-                updateFuelTank(fuelConsumedLiters);
-                
-                // Cria relatório de condução
-                DrivingData report = new DrivingData(
-                        this.idCar, 
-                        this.driverID, 
-                        System.currentTimeMillis(), 
-                        currentPosition.x, 
-                        currentPosition.y,
-						geoCoords,
-                        roadID,
-                        routeID,
-                        speed,
-                        odometer,
-                        fuelConsumption,
-                        calculateAverageFuelConsumption(),
-                        this.fuelType, 
-                        this.fuelPrice,
-                        co2Emission,
-                        hcEmission,
-                        this.personCapacity,
-                        this.personNumber
-                );
-                
-                // Adiciona coordenadas geográficas ao relatório
-                // Nota: Como DrivingData não tem setters para lat/lon, seria necessário modificar a classe
-                // ou criar uma classe estendida. Por enquanto, apenas armazenamos os valores.
-                
-                // Adiciona o relatório à lista
-                this.drivingReport.add(report);
-                
-                // Exibe informações no console
-                System.out.println("idCar = " + this.idCar);
-                System.out.println("speed = " + speed);
-                System.out.println("odometer = " + odometer);
-                System.out.println("Fuel Consumption = " + fuelConsumption);
-                System.out.println("Fuel Tank = " + this.fuelTank + " litros");
-                System.out.println("CO2 Emission = " + co2Emission);
-                System.out.println("Longitude = " + lon + ", Latitude = " + lat);
-                System.out.println("getPersonNumber = " + this.personNumber);
-                System.out.println("************************");
-                
-                // Verifica se precisa abastecer
-                if (this.fuelTank <= REFUEL_THRESHOLD && !refueling) {
-                    startRefueling();
-                }
-                
-                // Controla a velocidade do veículo
-                try {
-                    // Se não estiver abastecendo, mantém a velocidade normal
-                    if (!refueling) {
-                        sumo.do_job_set(Vehicle.setSpeedMode(this.idCar, 0));
-                        sumo.do_job_set(Vehicle.setSpeed(this.idCar, 10));
-                    }
-                } catch (Exception e) {
-                    logger.warning("Erro ao definir velocidade do carro " + idCar + ": " + e.getMessage());
-                }
+    private void sendSingleDrivingDataToCompany(DrivingData dataPoint) {
+        String logPrefix = "CAR_SEND (" + idCar + "): ";
+        if (dataPoint == null) {
+            logger.warning(logPrefix + "dataPoint é nulo, não pode enviar.");
+            return;
+        }
+        if (!this.connected) {
+            logger.warning(logPrefix + "NÃO CONECTADO à Company. Dados NÃO ENVIADOS para timestamp: " + dataPoint.getTimeStamp());
+            return;
+        }
+        if (this.companySessionEncryptor == null) {
+             logger.severe(logPrefix + "ERRO CRÍTICO - companySessionEncryptor NULO ao tentar enviar dados. Handshake com Company falhou? Dados NÃO ENVIADOS para timestamp: " + dataPoint.getTimeStamp());
+             this.connected = false; // Marcar para possível reconexão
+             return;
+        }
 
-            } else {
-                System.out.println("SUMO is closed...");
+        try {
+            String reportJson = JsonUtil.toJson(dataPoint);
+            // logger.fine(logPrefix + "JSON para Company: " + reportJson);
+            String encryptedReportJson = this.companySessionEncryptor.criptografar(reportJson);
+            // logger.fine(logPrefix + "JSON Criptografado (início): " + encryptedReportJson.substring(0, Math.min(encryptedReportJson.length(), 30)) + "...");
+            
+            if (companyOut == null) {
+                logger.severe(logPrefix + "companyOut é NULO. Impossível enviar dados.");
+                cleanup(); // Tenta limpar e força reconexão
+                return;
             }
+
+            companyOut.writeObject(encryptedReportJson);
+            companyOut.flush();
+            logger.info(logPrefix + "DrivingData CRIPTOGRAFADO enviado para Company (Timestamp: " + dataPoint.getTimeStamp() + ")");
+        } catch (java.net.SocketException se) {
+            logger.log(Level.SEVERE, logPrefix + "SocketException ao enviar DrivingData: " + se.getMessage() + ". Conexão provavelmente perdida.", se);
+            logger.info("CAR_SEND (" + idCar + "): Enviando TS: " + dataPoint.getTimeStamp() + ". Encryptor OK? " + (this.companySessionEncryptor != null));
+            cleanup();
         } catch (Exception e) {
-            logger.severe("Erro ao atualizar sensores do carro " + idCar + ": " + e.getMessage());
-            e.printStackTrace();
+            logger.log(Level.SEVERE, logPrefix + "FALHA ao enviar DrivingData criptografado: " + e.getMessage(), e);
+            cleanup(); 
         }
     }
     
@@ -510,17 +542,17 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
      * @return Consumo médio em km/L
      */
     private double calculateAverageFuelConsumption() {
-        if (drivingReport.isEmpty()) {
+        if (drivingReport_LOCAL.isEmpty()) {
             return 0.0;
         }
         
         // Calcula a média dos últimos relatórios
         double totalConsumption = 0.0;
         int count = 0;
-        int maxSamples = Math.min(10, drivingReport.size());
+        int maxSamples = Math.min(10, drivingReport_LOCAL.size());
         
-        for (int i = drivingReport.size() - 1; i >= drivingReport.size() - maxSamples; i--) {
-            totalConsumption += drivingReport.get(i).getFuelConsumption();
+        for (int i = drivingReport_LOCAL.size() - 1; i >= drivingReport_LOCAL.size() - maxSamples; i--) {
+            totalConsumption += drivingReport_LOCAL.get(i).getFuelConsumption();
             count++;
         }
         
@@ -539,39 +571,6 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
         double dx = pos2.x - pos1.x;
         double dy = pos2.y - pos1.y;
         return Math.sqrt(dx * dx + dy * dy);
-    }
-    
-    /**
-     * Envia dados de condução para o servidor Company.
-     */
-    private void sendDrivingDataToCompany() {
-        try {
-            // Verifica se há dados para enviar
-            if (drivingReport.isEmpty()) {
-                return;
-            }
-            
-            // Obtém o último relatório
-            DrivingData lastReport = drivingReport.get(drivingReport.size() - 1);
-            
-            // Converte para JSON
-            String reportJson = JsonUtil.toJson(lastReport);
-            
-            // Envia para o servidor
-            companyOut.writeObject(reportJson);
-            companyOut.flush();
-            
-            logger.fine("Car " + idCar + " enviou dados para Company");
-        } catch (Exception e) {
-            logger.warning("Erro ao enviar dados para Company: " + e.getMessage());
-            
-            // Tenta reconectar em caso de erro
-            try {
-                reconnectToCompany();
-            } catch (Exception reconnectError) {
-                logger.severe("Falha ao reconectar à Company: " + reconnectError.getMessage());
-            }
-        }
     }
     
     /**
@@ -622,11 +621,14 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
     /**
      * Classe interna para representar uma solicitação de registro.
      */
-    private static class CarRegistration {
+    public static class CarRegistration {
         private String carId;
         private String driverId;
         private String clientType;
         
+        public CarRegistration() {
+        }
+
         public CarRegistration(String carId, String driverId, String clientType) {
             this.carId = carId;
             this.driverId = driverId;
@@ -645,6 +647,10 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
         public String getClientType() {
             return clientType;
         }
+
+        public void setCarId(String carId) { this.carId = carId; }
+        public void setDriverId(String driverId) { this.driverId = driverId; }
+        public void setClientType(String clientType) { this.clientType = clientType; }
     }
     
     // Getters e Setters
@@ -749,12 +755,19 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
         this.personNumber = personNumber;
     }
 
-    public ArrayList<DrivingData> getDrivingRepport() {
-        return drivingReport;
+    public ArrayList<DrivingData> getDrivingRepport() { // Mantém para o Driver pegar no final da rota
+        return new ArrayList<>(this.drivingReport_LOCAL); // Retorna uma cópia
+    }
+
+    public void clearDrivingRepport() { // Usado pelo Driver após processar os dados de uma rota
+        this.drivingReport_LOCAL.clear();
+        this.lastPosition = null; 
+        // this.distanceSinceLastReport = 0.0; // Se você tinha esse campo, resete-o.
+        logger.info("Car " + idCar + ": Relatório de condução local (drivingReport_LOCAL) limpo.");
     }
 
     public void setDrivingRepport(ArrayList<DrivingData> drivingRepport) {
-        this.drivingReport = drivingRepport;
+        this.drivingReport_LOCAL = drivingRepport;
     }
     
     public double getFuelTank() {
@@ -774,7 +787,7 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
 	}
 
     public double getTotalDistance() {
-        return totalDistance;
+        return totalOdometer;
     }
     
     public boolean isConnected() {
