@@ -12,6 +12,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import org.apache.poi.ss.usermodel.BorderStyle;
 import org.apache.poi.ss.usermodel.Cell;
@@ -33,14 +35,8 @@ import io.sim.DrivingData;
  */
 public class ExcelReportGenerator {
     
+    private static final Logger logger = Logger.getLogger(ExcelReportGenerator.class.getName());
     private static ExcelReportGenerator instance;
-    //private final ReadWriteLock lock = new ReentrantReadWriteLock();
-    
-    // Armazena dados de condução por veículo
-    //private final Map<String, List<DrivingData>> drivingDataByVehicle;
-    
-    // Armazena listeners para notificação de novos dados
-    //private final List<DrivingDataListener> listeners;
     
     // Formato de data para nomes de arquivos
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
@@ -52,8 +48,7 @@ public class ExcelReportGenerator {
      * Construtor privado para implementar o padrão Singleton.
      */
     private ExcelReportGenerator() {
-        //drivingDataByVehicle = new ConcurrentHashMap<>();
-        //listeners = new CopyOnWriteArrayList<>();
+        logger.info("ExcelReportGenerator inicializado");
     }
     
     /**
@@ -78,171 +73,9 @@ public class ExcelReportGenerator {
             directory += "/";
         }
         this.reportDirectory = directory;
+        logger.info("Diretório de relatórios definido para: " + this.reportDirectory);
     }
     
-    /**
-     * Adiciona dados de condução para um veículo específico.
-     * 
-     * @param data Dados de condução a serem adicionados
-     */
-    // public void addDrivingData(DrivingData data) {
-    //     if (data == null) {
-    //         return;
-    //     }
-        
-    //     String vehicleId = data.getAutoID();
-        
-    //     lock.writeLock().lock();
-    //     try {
-    //         // Obtém ou cria a lista de dados para o veículo
-    //         List<DrivingData> vehicleData = drivingDataByVehicle.computeIfAbsent(
-    //                 vehicleId, k -> new ArrayList<>());
-            
-    //         // Adiciona os novos dados
-    //         vehicleData.add(data);
-            
-    //         // Notifica os listeners sobre os novos dados
-    //         notifyListeners(data);
-    //     } finally {
-    //         lock.writeLock().unlock();
-    //     }
-    // }
-    
-    /**
-     * Adiciona uma lista de dados de condução.
-     * 
-     * @param dataList Lista de dados de condução
-     */
-    // public void addDrivingDataBatch(List<DrivingData> dataList) {
-    //     if (dataList == null || dataList.isEmpty()) {
-    //         return;
-    //     }
-        
-    //     lock.writeLock().lock();
-    //     try {
-    //         for (DrivingData data : dataList) {
-    //             if (data != null) {
-    //                 String vehicleId = data.getAutoID();
-                    
-    //                 // Obtém ou cria a lista de dados para o veículo
-    //                 List<DrivingData> vehicleData = drivingDataByVehicle.computeIfAbsent(
-    //                         vehicleId, k -> new ArrayList<>());
-                    
-    //                 // Adiciona os novos dados
-    //                 vehicleData.add(data);
-                    
-    //                 // Notifica os listeners sobre os novos dados
-    //                 notifyListeners(data);
-    //             }
-    //         }
-    //     } finally {
-    //         lock.writeLock().unlock();
-    //     }
-    // }
-    
-    /**
-     * Obtém todos os dados de condução para um veículo específico.
-     * 
-     * @param vehicleId ID do veículo
-     * @return Lista de dados de condução
-     */
-    // public List<DrivingData> getDrivingDataForVehicle(String vehicleId) {
-    //     lock.readLock().lock();
-    //     try {
-    //         List<DrivingData> data = drivingDataByVehicle.get(vehicleId);
-    //         if (data == null) {
-    //             return new ArrayList<>();
-    //         }
-    //         return new ArrayList<>(data);
-    //     } finally {
-    //         lock.readLock().unlock();
-    //     }
-    // }
-    
-    /**
-     * Obtém todos os dados de condução para todos os veículos.
-     * 
-     * @return Mapa de dados de condução por veículo
-     */
-    // public Map<String, List<DrivingData>> getAllDrivingData() {
-    //     lock.readLock().lock();
-    //     try {
-    //         Map<String, List<DrivingData>> result = new HashMap<>();
-    //         for (Map.Entry<String, List<DrivingData>> entry : drivingDataByVehicle.entrySet()) {
-    //             result.put(entry.getKey(), new ArrayList<>(entry.getValue()));
-    //         }
-    //         return result;
-    //     } finally {
-    //         lock.readLock().unlock();
-    //     }
-    // }
-    
-    /**
-     * Limpa todos os dados de condução armazenados.
-     */
-    // public void clearAllData() {
-    //     lock.writeLock().lock();
-    //     try {
-    //         drivingDataByVehicle.clear();
-    //     } finally {
-    //         lock.writeLock().unlock();
-    //     }
-    // }
-    
-    /**
-     * Limpa os dados de condução para um veículo específico.
-     * 
-     * @param vehicleId ID do veículo
-     */
-    // public void clearDataForVehicle(String vehicleId) {
-    //     lock.writeLock().lock();
-    //     try {
-    //         drivingDataByVehicle.remove(vehicleId);
-    //     } finally {
-    //         lock.writeLock().unlock();
-    //     }
-    // }
-    
-    /**
-     * Adiciona um listener para ser notificado sobre novos dados.
-     * 
-     * @param listener Listener a ser adicionado
-     */
-    // public void addDrivingDataListener(DrivingDataListener listener) {
-    //     if (listener != null) {
-    //         listeners.add(listener);
-    //     }
-    // }
-    
-    /**
-     * Remove um listener.
-     * 
-     * @param listener Listener a ser removido
-     */
-    // public void removeDrivingDataListener(DrivingDataListener listener) {
-    //     if (listener != null) {
-    //         listeners.remove(listener);
-    //     }
-    // }
-    
-    /**
-     * Notifica todos os listeners sobre novos dados.
-     * 
-     * @param data Novos dados de condução
-     */
-    // private void notifyListeners(DrivingData data) {
-    //     for (DrivingDataListener listener : listeners) {
-    //         listener.onNewDrivingData(data);
-    //     }
-    // }
-    
-    /**
-     * Gera um relatório Excel para um veículo específico.
-     * 
-     * @param vehicleId ID do veículo
-     * @return Caminho do arquivo gerado
-     * @throws IOException Se ocorrer um erro ao gerar o relatório
-     */
     /**
      * Gera um relatório Excel para um veículo específico.
      * AGORA RECEBE OS DADOS COMO PARÂMETRO.
@@ -252,13 +85,66 @@ public class ExcelReportGenerator {
      * @throws IOException Se ocorrer um erro ao gerar o relatório
      */
     public String generateReportForVehicle(String vehicleId, List<DrivingData> data) throws IOException {
-        // List<DrivingData> data = getDrivingDataForVehicle(vehicleId); // REMOVIDO
-        if (data == null || data.isEmpty()) { // Verifica os dados recebidos
+        if (data == null || data.isEmpty()) {
             throw new IllegalArgumentException("Não há dados disponíveis para o veículo: " + vehicleId);
         }
-        // ... (resto do método como estava, usando a 'data' recebida) ...
+        
         String fileName = reportDirectory + vehicleId + "_" + dateFormat.format(new Date()) + ".xlsx";
-        // ... (lógica de criação do Excel como estava) ...
+        logger.info("Gerando relatório Excel para o veículo " + vehicleId + " em: " + fileName);
+        
+        try (Workbook workbook = new XSSFWorkbook()) {
+            // Cria a planilha de dados detalhados
+            Sheet sheet = workbook.createSheet(vehicleId);
+            
+            // Cria estilos para o cabeçalho
+            CellStyle headerStyle = createHeaderStyle(workbook);
+            
+            // Cria o cabeçalho
+            Row headerRow = sheet.createRow(0);
+            String[] headers = {
+                "Timestamp", "ID do Veículo", "Velocidade (m/s)", "Odômetro (m)",
+                "Combustível (L)", "Consumo (mg)", "Emissão CO2 (mg)", "Longitude", "Latitude"
+            };
+            
+            for (int i = 0; i < headers.length; i++) {
+                Cell cell = headerRow.createCell(i);
+                cell.setCellValue(headers[i]);
+                cell.setCellStyle(headerStyle);
+                sheet.setColumnWidth(i, 4000);
+            }
+            
+            // Preenche os dados
+            int rowNum = 1;
+            for (DrivingData item : data) {
+                Row row = sheet.createRow(rowNum++);
+                
+                row.createCell(0).setCellValue(new Date(item.getTimeStamp()).toString());
+                row.createCell(1).setCellValue(item.getCarID());
+                row.createCell(2).setCellValue(item.getSpeed());
+                row.createCell(3).setCellValue(item.getOdometer());
+                row.createCell(4).setCellValue(item.getFuelConsumption());
+                row.createCell(5).setCellValue(item.getFuelConsumption());
+                row.createCell(6).setCellValue(item.getCo2Emission());
+                row.createCell(7).setCellValue(item.getLatLon()[0]);
+                row.createCell(8).setCellValue(item.getLatLon()[1]);
+            }
+            
+            // Cria a planilha de resumo
+            createSummarySheet(workbook, data, vehicleId);
+            
+            // Salva o workbook em um arquivo
+            try (FileOutputStream fileOut = new FileOutputStream(fileName)) {
+                workbook.write(fileOut);
+                logger.info("Relatório Excel para o veículo " + vehicleId + " gerado com sucesso em: " + fileName);
+            } catch (IOException e) {
+                logger.log(Level.SEVERE, "Erro ao salvar relatório Excel para o veículo " + vehicleId + ": " + e.getMessage(), e);
+                throw e;
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Erro ao gerar relatório Excel para o veículo " + vehicleId + ": " + e.getMessage(), e);
+            throw new IOException("Erro ao gerar relatório Excel: " + e.getMessage(), e);
+        }
+        
         return fileName;
     }
     
@@ -270,15 +156,79 @@ public class ExcelReportGenerator {
      * @throws IOException Se ocorrer um erro ao gerar o relatório
      */
     public String generateConsolidatedReport(Map<String, ArrayList<DrivingData>> allData) throws IOException {
-        // Map<String, List<DrivingData>> allData = getAllDrivingData(); // REMOVIDO
-        // A linha 338 era esta verificação:
         if (allData == null || allData.isEmpty()) {
             throw new IllegalArgumentException("Não há dados disponíveis (recebidos) para gerar o relatório consolidado");
         }
         
         String fileName = reportDirectory + "consolidated_report_" + dateFormat.format(new Date()) + ".xlsx";
-        // ... (resto do método como estava, iterando sobre 'allData' recebido) ...
-        // Ex: for (Map.Entry<String, List<DrivingData>> entry : allData.entrySet()) { ... }
+        logger.info("Gerando relatório Excel consolidado em: " + fileName + " com dados de " + allData.size() + " veículos");
+        
+        try (Workbook workbook = new XSSFWorkbook()) {
+            // Cria a planilha de resumo consolidado
+            createConsolidatedSummarySheet(workbook, allData);
+            
+            // Para cada veículo, cria uma planilha de dados detalhados
+            for (Map.Entry<String, ArrayList<DrivingData>> entry : allData.entrySet()) {
+                String vehicleId = entry.getKey();
+                ArrayList<DrivingData> vehicleData = entry.getValue();
+                
+                if (vehicleData.isEmpty()) {
+                    continue;
+                }
+                
+                // Cria a planilha de dados detalhados
+                Sheet sheet = workbook.createSheet(vehicleId);
+                
+                // Cria estilos para o cabeçalho
+                CellStyle headerStyle = createHeaderStyle(workbook);
+                
+                // Cria o cabeçalho
+                Row headerRow = sheet.createRow(0);
+                String[] headers = {
+                    "Timestamp", "ID do Veículo", "Velocidade (m/s)", "Odômetro (m)",
+                    "Combustível (L)", "Consumo (mg)", "Emissão CO2 (mg)", "Longitude", "Latitude"
+                };
+                
+                for (int i = 0; i < headers.length; i++) {
+                    Cell cell = headerRow.createCell(i);
+                    cell.setCellValue(headers[i]);
+                    cell.setCellStyle(headerStyle);
+                    sheet.setColumnWidth(i, 4000);
+                }
+                
+                // Preenche os dados
+                int rowNum = 1;
+                for (DrivingData item : vehicleData) {
+                    Row row = sheet.createRow(rowNum++);
+                    
+                    row.createCell(0).setCellValue(new Date(item.getTimeStamp()).toString());
+                    row.createCell(1).setCellValue(item.getCarID());
+                    row.createCell(2).setCellValue(item.getSpeed());
+                    row.createCell(3).setCellValue(item.getOdometer());
+                    row.createCell(4).setCellValue(item.getFuelConsumption());
+                    row.createCell(5).setCellValue(item.getFuelConsumption());
+                    row.createCell(6).setCellValue(item.getCo2Emission());
+                    row.createCell(7).setCellValue(item.getLatLon()[0]);
+                    row.createCell(8).setCellValue(item.getLatLon()[1]);
+                }
+                
+                // Cria a planilha de resumo para o veículo
+                createSummarySheet(workbook, vehicleData, vehicleId);
+            }
+            
+            // Salva o workbook em um arquivo
+            try (FileOutputStream fileOut = new FileOutputStream(fileName)) {
+                workbook.write(fileOut);
+                logger.info("Relatório Excel consolidado gerado com sucesso em: " + fileName);
+            } catch (IOException e) {
+                logger.log(Level.SEVERE, "Erro ao salvar relatório Excel consolidado: " + e.getMessage(), e);
+                throw e;
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Erro ao gerar relatório Excel consolidado: " + e.getMessage(), e);
+            throw new IOException("Erro ao gerar relatório Excel consolidado: " + e.getMessage(), e);
+        }
+        
         return fileName;
     }
     
@@ -335,7 +285,7 @@ public class ExcelReportGenerator {
             "Número de Registros", "Primeiro Registro", "Último Registro"
         };
         
-        String vehicleId = data.isEmpty() ? "N/A" : data.get(0).getAutoID();
+        String vehicleId = data.isEmpty() ? "N/A" : data.get(0).getCarID();
         String firstTimestamp = data.isEmpty() ? "N/A" : new Date(data.get(0).getTimeStamp()).toString();
         String lastTimestamp = data.isEmpty() ? "N/A" : new Date(data.get(data.size() - 1).getTimeStamp()).toString();
         
@@ -372,7 +322,7 @@ public class ExcelReportGenerator {
      * @param workbook Workbook do Excel
      * @param allData Dados de todos os veículos
      */
-    private void createConsolidatedSummarySheet(Workbook workbook, Map<String, List<DrivingData>> allData) {
+    private void createConsolidatedSummarySheet(Workbook workbook, Map<String, ? extends List<DrivingData>> allData) {
         Sheet sheet = workbook.createSheet("Resumo_Consolidado");
         
         // Cria estilos para o cabeçalho
@@ -394,7 +344,7 @@ public class ExcelReportGenerator {
         
         // Preenche os dados de resumo para cada veículo
         int rowNum = 1;
-        for (Map.Entry<String, List<DrivingData>> entry : allData.entrySet()) {
+        for (Map.Entry<String, ? extends List<DrivingData>> entry : allData.entrySet()) {
             String vehicleId = entry.getKey();
             List<DrivingData> vehicleData = entry.getValue();
             

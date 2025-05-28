@@ -263,8 +263,8 @@ public class MobilityCompany extends Thread {
                     DrivingData drivingData = JsonUtil.fromJson(plainDrivingDataJson, DrivingData.class);
                     
                     if (drivingData != null) {
-                        if (!registeredCarId.equals(drivingData.getAutoID())) {
-                             logger.warning(logPrefix + "ID do carro no DrivingData (" + drivingData.getAutoID() + 
+                        if (!registeredCarId.equals(drivingData.getCarID())) {
+                             logger.warning(logPrefix + "ID do carro no DrivingData (" + drivingData.getCarID() + 
                                            ") não corresponde ao ID da sessão (" + registeredCarId + "). Descartando.");
                              continue; 
                         }
