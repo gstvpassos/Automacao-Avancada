@@ -1,48 +1,71 @@
 package io.sim;
 
-import io.sim.reporting.ReportingSystem;
+import sim.traci4j.src.java.it.polito.appeal.traci.Repository;
+import sim.traci4j.src.java.it.polito.appeal.traci.Edge;
+import sim.traci4j.src.java.it.polito.appeal.traci.Lane;
 
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.math.BigDecimal;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.math.BigDecimal;
 import java.net.Socket;
 import java.security.PublicKey;
 import java.util.ArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import de.tudresden.sumo.cmd.Vehicle;
-import sim.traci4j.src.java.it.polito.appeal.traci.Repository;
-import sim.traci4j.src.java.it.polito.appeal.traci.Edge;
-import sim.traci4j.src.java.it.polito.appeal.traci.Lane;
 import de.tudresden.sumo.objects.SumoColor;
 import de.tudresden.sumo.objects.SumoPosition2D;
+import de.tudresden.sumo.objects.SumoStringList;
 import it.polito.appeal.traci.SumoTraciConnection;
-import java.awt.geom.Point2D;
+
+import io.sim.reporting.ReportingSystem;
 import io.sim.utils.JsonUtil;
 import io.sim.utils.GeoUtils;
 
 /**
- * Classe que representa um carro no sistema de simulação.
- * Implementa Runnable para execução concorrente e atua como cliente para o servidor Company.
+ * Representa um veículo inteligente no sistema de simulação de mobilidade urbana.
+ * 
+ * <p>Esta classe implementa um veículo autônomo que:
+ * <ul>
+ *   <li>Coleta dados de sensores em tempo real do SUMO</li>
+ *   <li>Gerencia consumo de combustível e abastecimento</li>
+ *   <li>Comunica-se com sistemas bancários para pagamentos</li>
+ *   <li>Reporta dados de condução para análise</li>
+ *   <li>Executa em thread separada para operação concorrente</li>
+ * </ul></p>
+ * 
+ * <p>O veículo utiliza sincronização adequada para operações thread-safe
+ * com o simulador SUMO e outros componentes do sistema.</p>
+ * 
+ * @author Sistema SUMO Simulator
+ * @version 1.0
+ * @since 1.0
  */
 public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle implements Runnable {
 
     private static final Logger logger = Logger.getLogger(Car.class.getName());
+    private CountDownLatch readyLatch;
+
+    // Constantes de configuração do veículo
     private static final double REFUEL_THRESHOLD = 3.0; // Limite para abastecimento (3 litros)
     private static final double INITIAL_FUEL = 10.0; // Combustível inicial (10 litros)
     private static final long REFUEL_TIME = 120000; // Tempo de abastecimento (2 minutos em milissegundos)
 
-    // Identificação do carro
+    // Identificação e configuração do veículo
     private String idCar;
     private SumoColor colorCar;
     private String driverID;
     private SumoTraciConnection sumo;
+    
+    // Objeto de sincronização para operações SUMO thread-safe
+    private Object sumoLock;
 
-    // Controle de execução
+    // Controle de execução da thread
     private boolean on_off;
     private long acquisitionRate;
     
@@ -55,6 +78,7 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
 
     // Conexão com servidores
     private MobilityCompany companyServer; // Para enviar dados
+    private int companyPort = 12346;
     private FuelStation fuelStation;       // Para solicitar abastecimento
     private Socket companyConnection;
     private ObjectOutputStream companyOut;
@@ -73,19 +97,25 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
     private ArrayList<DrivingData> drivingReport_LOCAL;
     private SumoPosition2D lastPosition;
     private double totalOdometer;
+    private double distanceSinceLastRefuel;
     private double distanceSinceLastReport;
-
-    // Criptografia dos dados de direção
-    private EncriptaDecriptaDES companySessionEncryptor; // Para criptografia com MobilityCompany
+    
+    // Conexão com Company
+    private EncriptaDecriptaDES companySessionEncryptor;
     
     /**
-     * Construtor principal do Car.
+     * Construtor da classe Car.
      * 
+     * @param _dis DataInputStream
+     * @param _dos DataOutputStream
+     * @param _repoEdge Repositório de arestas
+     * @param _repoLane Repositório de pistas
      * @param _on_off Estado inicial (ligado/desligado)
      * @param _idCar ID do carro
      * @param _colorCar Cor do carro
      * @param _driverID ID do motorista
      * @param _sumo Conexão com o SUMO
+     * @param _sumoLock Objeto de sincronização para operações SUMO
      * @param _acquisitionRate Taxa de aquisição de dados
      * @param _fuelType Tipo de combustível
      * @param _fuelPreferential Tipo de combustível preferencial
@@ -95,19 +125,20 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
      * @throws Exception Se ocorrer um erro na inicialização
      */
     public Car(DataInputStream _dis, DataOutputStream _dos, Repository<Edge> _repoEdge, Repository<Lane> _repoLane, boolean _on_off, String _idCar, SumoColor _colorCar, String _driverID, SumoTraciConnection _sumo, 
-            long _acquisitionRate, int _fuelType, int _fuelPreferential, double _fuelPrice, 
-            int _personCapacity, int _personNumber) throws Exception {
+            Object _sumoLock, long _acquisitionRate, int _fuelType, int _fuelPreferential, double _fuelPrice, 
+            int _personCapacity, int _personNumber, CountDownLatch readyLatch) throws Exception {
         
         // Chama o construtor da classe pai (Vehicle)
         super(_dis, _dos, _idCar, _repoEdge, _repoLane);
         
+        this.readyLatch = readyLatch;
         this.on_off = _on_off;
         this.idCar = _idCar;
         this.colorCar = _colorCar;
         this.driverID = _driverID;
         this.sumo = _sumo;
-        this.acquisitionRate = _acquisitionRate;
-        
+        this.sumoLock = _sumoLock;
+        this.acquisitionRate = _acquisitionRate;     
         if((_fuelType < 0) || (_fuelType > 4)) {
             this.fuelType = 4;
         } else {
@@ -230,45 +261,125 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
      * Método principal da thread.
      * Gerencia a execução do carro, atualizando sensores e enviando dados.
      */
-    
+
     @Override
     public void run() {
-        // A conexão com a Company agora deve ser estabelecida ANTES de iniciar a thread do Car
-        if (!this.connected || this.companySessionEncryptor == null) {
-            logger.severe("Car " + idCar + " iniciando run() SEM conexão segura com a Company. Encerrando thread do carro.");
-            this.on_off = false; // Garante que o loop não execute
+        // =================================================================
+        // PARTE 1: INICIALIZAÇÃO E CONEXÃO
+        // =================================================================
+        boolean successfullyInitialized = false;
+        int maxConnectionAttempts = 5; // Tenta conectar até 5 vezes
+        long retryDelayMs = 1000; // Espera 1 segundo entre as tentativas
+
+        // MUDANÇA #1: Adicionar um loop de retentativas para a conexão
+        for (int attempt = 1; attempt <= maxConnectionAttempts; attempt++) {
+            try {
+                // Tenta conectar à MobilityCompany.
+                connectToCompany("localhost", this.companyPort);
+
+                if (isConnected()) {
+                    logger.info("Car " + getIdCar() + " conectado com sucesso na tentativa " + attempt);
+                    successfullyInitialized = true;
+                    break; // Sucesso! Sai do loop de retentativas.
+                }
+            } catch (IOException e) {
+                logger.warning("Car " + getIdCar() + " falhou na tentativa de conexão " + attempt + "/" + maxConnectionAttempts + ": " + e.getMessage());
+                if (attempt < maxConnectionAttempts) {
+                    try {
+                        Thread.sleep(retryDelayMs); // Espera antes de tentar novamente
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
         }
 
+        // Se após todas as tentativas a inicialização falhou, encerra a thread.
+        if (!successfullyInitialized) {
+            logger.severe("Car " + getIdCar() + " falhou em conectar à Company após " + maxConnectionAttempts + " tentativas. Encerrando thread.");
+            // Importante: NÃO chama o countDown() aqui.
+            return;
+        }
+
+        // Se chegou aqui, a inicialização foi um SUCESSO.
+        logger.info("Car " + getIdCar() + " inicializado e pronto para o trabalho.");
+        
+        // Sinaliza que está pronto APENAS em caso de sucesso.
+        if (this.readyLatch != null) {
+            this.readyLatch.countDown();
+        }
+
+        // =================================================================
+        // PARTE 2: AGUARDAR A PARTIDA DO VEÍCULO NO SUMO (A NOVA LÓGICA)
+        // =================================================================
+        try {
+            logger.info("Car " + idCar + ": Aguardando partida na simulação...");
+            boolean hasDeparted = false;
+            while (!hasDeparted && this.on_off) {
+                synchronized (this.sumoLock) {
+                    // Vehicle.getIDList() só retorna carros que estão ATIVOS na via.
+                    // Esta é a verificação mais confiável para saber se o carro partiu.
+                    hasDeparted = ((SumoStringList)this.sumo.do_job_get(Vehicle.getIDList())).contains(this.idCar);
+                }
+                if (!hasDeparted) {
+                    Thread.sleep(500); // Espera meio segundo antes de checar de novo
+                }
+            }
+
+            if (hasDeparted) {
+            logger.info("Car " + idCar + ": PARTIU! Iniciando envio de telemetria.");
+            } else {
+            // Se saiu do loop sem ter partido, é porque a simulação foi encerrada.
+            logger.warning("Car " + idCar + ": Não detectou a partida (simulação pode ter encerrado). Encerrando.");
+            cleanup();
+            return;
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Car " + idCar + ": Erro enquanto aguardava a partida. Encerrando.", e);
+            cleanup();
+            return;
+        }
+
+        // =================================================================
+        // PARTE 3: LOOP DE TRABALHO PRINCIPAL
+        // Este código só será alcançado se a PARTE 1 for bem-sucedida.
+        // =================================================================
         while (this.on_off) {
             try {
                 if (refueling) {
                     handleRefueling();
                 } else {
-                    Thread.sleep(this.acquisitionRate);
-                    
+                    // Obtém os dados do SUMO. Este método deve ser seguro e não quebrar.
                     DrivingData newDataPoint = this.atualizaSensoresEObtemDados(); 
                     
-                    if (newDataPoint != null) { // Se for nulo, o erro já foi logado e on_off possivelmente false
-                        //logger.info("CAR_RUN (" + idCar + "): newDataPoint GERADO, tentando enviar.");
+                    if (newDataPoint != null) {
+                        // Envia os dados para a MobilityCompany.
                         sendSingleDrivingDataToCompany(newDataPoint);
                     } else {
-                        // Se newDataPoint é null, atualizaSensoresEObtemDados já deve ter lidado com on_off
-                        // logger.warning("CAR_RUN (" + idCar + "): newDataPoint é NULL. Verifique logs anteriores.");
-                        if (!this.on_off) { // Confirma se o carro foi desligado
-                             logger.info("CAR_RUN (" + idCar + "): Carro foi desligado devido a erro anterior na obtenção de dados.");
-                        }
+                        // Se não obteve dados, provavelmente o carro saiu da simulação.
+                        logger.info("CAR_RUN (" + idCar + "): Não foi possível obter dados (carro pode ter finalizado a rota). Encerrando loop.");
+                        this.on_off = false; // Define a flag para sair do loop.
                     }
+
+                    // Pausa antes do próximo ciclo.
+                    Thread.sleep(this.acquisitionRate);
                 }
             } catch (InterruptedException e) {
-                logger.warning("Car " + idCar + " thread interrompida: " + e.getMessage());
-                Thread.currentThread().interrupt();
-                this.on_off = false;
-            } catch (Exception e) { // Captura genérica para erros inesperados no loop principal do Car
-                logger.log(Level.SEVERE, "Erro inesperado na execução do Car " + idCar + ": " + e.getMessage(), e);
-                this.on_off = false; // Desliga o carro em caso de erro grave
+                logger.warning("Car " + idCar + " thread interrompida.");
+                this.on_off = false; // Garante a saída do loop.
+                Thread.currentThread().interrupt(); // Boa prática para restaurar o status da interrupção.
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Erro inesperado no loop de trabalho do Car " + idCar + ": " + e.getMessage(), e);
+                this.on_off = false; // Desliga o carro em caso de erro grave.
             }
         }
+
+        // =================================================================
+        // PARTE 4: LIMPEZA
+        // =================================================================
         cleanup();
+        logger.info("Thread do Car " + getIdCar() + " finalizada.");
     }
 
     /**
@@ -285,41 +396,54 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
         }
 
         try {
-            // Tenta uma operação básica para verificar se o veículo é conhecido
-            // Se esta falhar com "not known", as outras também falharão.
-            sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getSpeed(this.idCar)); // Teste de "conhecimento"
-
-            SumoPosition2D sumoPosition2D = (SumoPosition2D) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getPosition(this.idCar));
-            //Point2D currentAwtPosition = getPosition(); // Este método é da superclasse TraciObject -> Vehicle
-
-            if (sumoPosition2D == null) { // Pode acontecer se o veículo foi removido entre os comandos
-                 logger.warning(logPrefix + "Posição nula do SUMO (veículo pode ter sido removido inesperadamente). Desligando carro.");
-                 this.on_off = false; 
-                 return null;
-            }
+            // Declara variáveis que serão usadas fora do bloco synchronized
+            SumoPosition2D sumoPosition2D;
+            String roadID_fromSUMO;
+            String routeID_fromSUMO;
+            double speed_fromSUMO;
+            double odometerFromSUMOForRoute;
+            double fuelConsumptionSim_fromSUMO;
+            double co2Emission_fromSUMO;
+            double hcEmission_fromSUMO;
             
-            // Verificação de NaN ou Infinito
-            if (Double.isNaN(sumoPosition2D.x) || Double.isNaN(sumoPosition2D.y) ||
-                Double.isInfinite(sumoPosition2D.x) || Double.isInfinite(sumoPosition2D.y)) {
-                logger.warning(logPrefix + "Posição SUMO (sumoPosition2D) contém NaN ou Infinito. x=" + sumoPosition2D.x + ", y=" + sumoPosition2D.y + ". Desligando carro.");
-                this.on_off = false;
-                return null;
-            }
+            // Sincroniza todas as operações SUMO para evitar conflitos entre threads
+            synchronized(sumoLock) {
+                // Tenta uma operação básica para verificar se o veículo é conhecido
+                // Se esta falhar com "not known", as outras também falharão.
+                sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getSpeed(this.idCar)); // Teste de "conhecimento"
 
-            double distanceDelta = 0.0;
-            if (lastPosition != null) {
-                distanceDelta = GeoUtils.calculateEuclideanDistance(sumoPosition2D.x, sumoPosition2D.y, lastPosition.x, lastPosition.y);
-                this.totalOdometer += distanceDelta;
-            }
-            this.lastPosition = sumoPosition2D;
+                sumoPosition2D = (SumoPosition2D) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getPosition(this.idCar));
+                //Point2D currentAwtPosition = getPosition(); // Este método é da superclasse TraciObject -> Vehicle
 
-            String roadID_fromSUMO = (String) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getRoadID(this.idCar));
-            String routeID_fromSUMO = (String) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getRouteID(this.idCar));
-            double speed_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getSpeed(this.idCar));
-            double odometerFromSUMOForRoute = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getDistance(this.idCar));
-            double fuelConsumptionSim_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getFuelConsumption(this.idCar));
-            double co2Emission_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getCO2Emission(this.idCar));
-            double hcEmission_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getHCEmission(this.idCar));
+                if (sumoPosition2D == null) { // Pode acontecer se o veículo foi removido entre os comandos
+                     logger.warning(logPrefix + "Posição nula do SUMO (veículo pode ter sido removido inesperadamente). Desligando carro.");
+                     this.on_off = false; 
+                     return null;
+                }
+                
+                // Verificação de NaN ou Infinito
+                if (Double.isNaN(sumoPosition2D.x) || Double.isNaN(sumoPosition2D.y) ||
+                    Double.isInfinite(sumoPosition2D.x) || Double.isInfinite(sumoPosition2D.y)) {
+                    logger.warning(logPrefix + "Posição SUMO (sumoPosition2D) contém NaN ou Infinito. x=" + sumoPosition2D.x + ", y=" + sumoPosition2D.y + ". Desligando carro.");
+                    this.on_off = false;
+                    return null;
+                }
+
+                double distanceDelta = 0.0;
+                if (lastPosition != null) {
+                    distanceDelta = GeoUtils.calculateEuclideanDistance(sumoPosition2D.x, sumoPosition2D.y, lastPosition.x, lastPosition.y);
+                    this.totalOdometer += distanceDelta;
+                }
+                this.lastPosition = sumoPosition2D;
+
+                roadID_fromSUMO = (String) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getRoadID(this.idCar));
+                routeID_fromSUMO = (String) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getRouteID(this.idCar));
+                speed_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getSpeed(this.idCar));
+                odometerFromSUMOForRoute = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getDistance(this.idCar));
+                fuelConsumptionSim_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getFuelConsumption(this.idCar));
+                co2Emission_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getCO2Emission(this.idCar));
+                hcEmission_fromSUMO = (double) sumo.do_job_get(de.tudresden.sumo.cmd.Vehicle.getHCEmission(this.idCar));
+            } // fim do bloco synchronized para operações SUMO
 
             double[] geoCoords = GeoUtils.convertToGeo(sumoPosition2D.x, sumoPosition2D.y);
 
@@ -574,36 +698,9 @@ public class Car extends sim.traci4j.src.java.it.polito.appeal.traci.Vehicle imp
     }
     
     /**
-     * Tenta reconectar ao servidor Company.
-     * 
-     * @throws Exception Se ocorrer um erro na reconexão
-     */
-    private void reconnectToCompany() throws Exception {
-        logger.info("Car " + idCar + " tentando reconectar ao servidor Company...");
-        
-        // Fecha conexão atual se existir
-        if (companyConnection != null && !companyConnection.isClosed()) {
-            try {
-                companyConnection.close();
-            } catch (IOException e) {
-                // Ignora erros ao fechar
-            }
-        }
-        
-        this.connected = false;
-        
-        // Tenta reconectar
-        String host = companyConnection.getInetAddress().getHostName();
-        int port = companyConnection.getPort();
-        
-        // Reconecta
-        connectToCompany(host, port);
-    }
-    
-    /**
      * Limpa recursos ao encerrar o carro.
      */
-    private void cleanup() {
+    public void cleanup() {
         // Fecha conexão com a Company
         try {
             if (companyOut != null) companyOut.close();

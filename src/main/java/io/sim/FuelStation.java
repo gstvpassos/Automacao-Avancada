@@ -77,34 +77,34 @@ public class FuelStation extends Thread {
      * @param name Nome do posto
      * @param account Conta bancária do posto
      */
-    public FuelStation(String stationId, String name, Account account) {
-        this.stationId = stationId;
-        this.name = name;
-        this.account = account;
-        this.running.set(false);
-        this.connected = false;
+    // public FuelStation(String stationId, String name, Account account) {
+    //     this.stationId = stationId;
+    //     this.name = name;
+    //     this.account = account;
+    //     this.running.set(false);
+    //     this.connected = false;
         
-        // Preços padrão dos combustíveis
-        this.dieselPrice = 5.20;
-        this.gasolinePrice = 5.87;
-        this.ethanolPrice = 4.59;
+    //     // Preços padrão dos combustíveis
+    //     this.dieselPrice = 5.20;
+    //     this.gasolinePrice = 5.87;
+    //     this.ethanolPrice = 4.59;
         
-        // Inicializa o semáforo com 2 permissões (2 bombas)
-        this.pumpSemaphore = new Semaphore(2, true);
+    //     // Inicializa o semáforo com 2 permissões (2 bombas)
+    //     this.pumpSemaphore = new Semaphore(2, true);
         
-        // Inicializa a fila de carros aguardando
-        this.waitingCars = new ConcurrentLinkedQueue<>();
+    //     // Inicializa a fila de carros aguardando
+    //     this.waitingCars = new ConcurrentLinkedQueue<>();
         
-        // Inicializa o bot de pagamento
-        try {
-            this.botPayment = new BotPayment(account, "localhost", 12345);
-        } catch (Exception e) {
-            logger.log(Level.WARNING, "Erro ao inicializar BotPayment: " + e.getMessage(), e);
-            // Continua mesmo sem o bot de pagamento
-        }
+    //     // Inicializa o bot de pagamento
+    //     try {
+    //         this.botPayment = new BotPayment(account, "localhost", bankPort);
+    //     } catch (Exception e) {
+    //         logger.log(Level.WARNING, "Erro ao inicializar BotPayment: " + e.getMessage(), e);
+    //         // Continua mesmo sem o bot de pagamento
+    //     }
         
-        logger.info("FuelStation " + stationId + " criada com sucesso");
-    }
+    //     logger.info("FuelStation " + stationId + " criada com sucesso");
+    // }
     
     /**
      * Construtor alternativo que inclui informações de conexão com o banco.
@@ -119,11 +119,33 @@ public class FuelStation extends Thread {
      */
     public FuelStation(String stationId, String name, String bankHost, int bankPort, 
                       String login, String senha, double initialBalance) {
-        this(stationId, name, new Account(senha, login, initialBalance));
-        this.bankHost = bankHost;
+        this.stationId = stationId;
+        this.name = name;
+        this.account = new Account(senha, login,initialBalance);
+        this.running.set(false);
+        this.connected = false;
         this.bankPort = bankPort;
-        this.login = login;
-        this.senha = senha;
+        
+        // Preços padrão dos combustíveis
+        this.dieselPrice = 5.20;
+        this.gasolinePrice = 5.87;
+        this.ethanolPrice = 4.59;
+        
+        // Inicializa o semáforo com 2 permissões (2 bombas)
+        this.pumpSemaphore = new Semaphore(2, true);
+        
+        // Inicializa a fila de carros aguardando
+        this.waitingCars = new ConcurrentLinkedQueue<>();
+        
+        // Inicializa o bot de pagamento
+        try {
+            this.botPayment = new BotPayment(account, "localhost", bankPort);
+        } catch (Exception e) {
+            logger.log(Level.WARNING, "Erro ao inicializar BotPayment: " + e.getMessage(), e);
+            // Continua mesmo sem o bot de pagamento
+        }
+        
+        logger.info("FuelStation " + stationId + " criada com sucesso");
     }
     
     /**

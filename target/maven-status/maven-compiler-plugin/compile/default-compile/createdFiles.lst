@@ -143,6 +143,7 @@ sim/traci4j/test/java/it/polito/appeal/traci/test/protocol/CommandTest.class
 io/sim/Car.class
 sim/traci4j/src/java/it/polito/appeal/traci/ReadLinksQuery.class
 sim/traci4j/test/java/it/polito/appeal/traci/test/protocol/MessageTest.class
+io/sim/reporting/RealTimeChartManager$1.class
 sim/traci4j/src/java/it/polito/appeal/traci/ControlledLinks.class
 sim/traci4j/src/java/it/polito/appeal/traci/VehicleLifecycleObserver.class
 sim/traci4j/src/java/it/polito/appeal/traci/Vehicle$2.class

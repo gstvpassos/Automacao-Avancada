@@ -207,7 +207,7 @@ public class DrivingData {
 		return this.routeIDSUMO;
 	}
 
-	public String getAutoID() {
+	public String getCarID() {
 		return this.carID;
 	}
 

@@ -179,7 +179,7 @@ public class ReportingSystem implements MobilityCompany.DrivingDataListener{
         if (data == null || !running) {
             return;
         }
-        logger.info("REPORTSYS_ON_NEW_DATA (Listener da MobilityCompany): Recebido DrivingData para Car: " + data.getAutoID() + ", TS: " + data.getTimeStamp() + ". Atualizando ChartManager.");
+        logger.info("REPORTSYS_ON_NEW_DATA (Listener da MobilityCompany): Recebido DrivingData para Car: " + data.getCarID() + ", TS: " + data.getTimeStamp() + ". Atualizando ChartManager.");
         // Atualiza os gráficos em tempo real com o novo dado
         if (chartManager != null) {
             chartManager.onNewDrivingData(data);

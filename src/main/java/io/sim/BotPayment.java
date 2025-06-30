@@ -139,7 +139,6 @@ public class BotPayment extends Thread {
      */
     private void connectToBank(String host, int port) throws IOException {
         try {
-            // Use seu logger aqui em vez de System.out/err para consistência
             logger.info("[BotPayment " + botId + "] Iniciando conexão com AlphaBank em " + host + ":" + port);
             this.bankConnection = new Socket(host, port);
             

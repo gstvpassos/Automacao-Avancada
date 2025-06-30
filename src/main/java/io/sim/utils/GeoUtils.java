@@ -16,6 +16,9 @@ public class GeoUtils {
     // String PROJ4 derivada da tag <location> do seu .net.xml
     // Adicionado "+south" porque as latitudes origBoundary são negativas.
     //private static final String SUMO_CRS_PROJ4_STRING = "+proj=utm +zone=23 +south +ellps=WGS84 +datum=WGS84 +units=m +no_defs";
+    // Valores do seu arquivo net.xml
+    private static double NET_OFFSET_X_FROM_FILE = -682757.55;
+    private static double NET_OFFSET_Y_FROM_FILE = 2543161.55; 
     private static final String SUMO_CRS_EPSG_CODE = "EPSG:32723"; // Usar código EPSG
     private static final String GEO_CRS_CODE = "EPSG:4326";
 
@@ -33,6 +36,8 @@ public class GeoUtils {
             // logger.info("GeoUtils.initialize(): SUMO CRS PROJ4 String = " + SUMO_CRS_PROJ4_STRING); // Não mais usado diretamente
             logger.info("GeoUtils.initialize(): SUMO CRS Code = " + SUMO_CRS_EPSG_CODE);
             logger.info("GeoUtils.initialize(): GEO CRS Code = " + GEO_CRS_CODE);
+            logger.info("GeoUtils.initialize(): Usando NetOffset X (do arquivo) = " + NET_OFFSET_X_FROM_FILE);
+            logger.info("GeoUtils.initialize(): Usando NetOffset Y (do arquivo) = " + NET_OFFSET_Y_FROM_FILE);
 
             // sumoCrs = crsFactory.createFromParameters("SUMO_UTM23S_WGS84", SUMO_CRS_PROJ4_STRING);
             sumoCrs = crsFactory.createFromName(SUMO_CRS_EPSG_CODE); // << MUDANÇA AQUI
@@ -57,32 +62,39 @@ public class GeoUtils {
      * @param y Coordenada Y no CRS do SUMO (UTM)
      * @return Array com [longitude, latitude] ou [NaN, NaN] em caso de erro.
      */
-    public static double[] convertToGeo(double x, double y) {
+    public static double[] convertToGeo(double internalSumoX, double internalSumoY) {
         if (sumoToGeo == null) {
             logger.severe("GeoUtils.sumoToGeo não está inicializado! Verifique o bloco estático e os códigos CRS. Coordenadas não convertidas.");
             return new double[] { Double.NaN, Double.NaN };
         }
+        // Aplicar o netOffset para obter as coordenadas UTM "verdadeiras"
+        // Baseado na análise de que o netOffset_x do arquivo é -EastingOfOrigin
+        double trueUtmX = internalSumoX - NET_OFFSET_X_FROM_FILE; //  internalSumoX - (-682757.55) = internalSumoX + 682757.55
+        // Para Y, a documentação do SUMO geralmente sugere adição.
+        // No entanto, o valor de NET_OFFSET_Y_FROM_FILE (2543161.55) é muito baixo para um Northing UTM 23S.
+        // Latitudes originais são ~ -22.9 graus. Northing UTM 23S ~ 7.450.000.
+        // Se internalSumoY (0 a ~4000) deve mapear para essa faixa, netOffsetY_from_file deveria ser ~7.450.000.
+        // O netOffset_y no seu arquivo parece ser um valor já em um sistema local ou um erro.
+        // Vamos seguir a documentação do SUMO: internal_coord + offset.
+        // Se isso ainda der problemas, a configuração de y da rede é a questão.
+        double trueUtmY = internalSumoY + NET_OFFSET_Y_FROM_FILE; 
+        //logger.info("GeoUtils: SUMO internal (x,y): (" + internalSumoX + ", " + internalSumoY + 
+                   // "). Com netOffset, True UTM (E,N) para proj4j: (" + trueUtmX + ", " + trueUtmY + ")");
 
-        ProjCoordinate srcCoord = new ProjCoordinate(x, y);
-        ProjCoordinate dstCoord = new ProjCoordinate();
-
-        // Adicionar logs aqui
-        if (srcCoord == null) {
-            logger.severe("GeoUtils: srcCoord é NULO antes da transformação para x=" + x + ", y=" + y);
-            return new double[] { Double.NaN, Double.NaN };
-        }
-        // logger.info("GeoUtils: srcCoord (x,y) antes da transformação: (" + srcCoord.x + ", " + srcCoord.y + ")"); // Já logado no Car.java
-        if (dstCoord == null) {
-            // Isto seria muito inesperado, pois dstCoord é instanciado logo acima.
-            logger.severe("GeoUtils: dstCoord é NULO antes da transformação para x=" + x + ", y=" + y);
-            return new double[] { Double.NaN, Double.NaN };
-        }
+        ProjCoordinate srcCoord = new ProjCoordinate(trueUtmX, trueUtmY);
+        ProjCoordinate dstCoord = new ProjCoordinate(); 
 
         try {
-            sumoToGeo.transform(srcCoord, dstCoord); // Linha 50 agora (após adicionar logs)
-            return new double[] { dstCoord.x, dstCoord.y };
-        } catch (Exception e) { // Capturar exceção mais genérica para ver se é NPE ou outra coisa
-            logger.log(Level.SEVERE, "GeoUtils: Erro EXATO durante a transformação de (" + x + ", " + y + "): " + e.getClass().getName() + " - " + e.getMessage(), e);
+            sumoToGeo.transform(srcCoord, dstCoord);
+            //logger.info("GeoUtils: Convertido para Lon: " + dstCoord.x + ", Lat: " + dstCoord.y + " (a partir de UTM E:" + trueUtmX + ", N:" + trueUtmY + ")");
+            // Verificação de validade básica para lat/lon
+            if (dstCoord.x < -180 || dstCoord.x > 180 || dstCoord.y < -90 || dstCoord.y > 90) {
+                logger.warning("GeoUtils: Coordenadas Lat/Lon resultantes parecem inválidas: Lon=" + dstCoord.x + ", Lat=" + dstCoord.y);
+                // return new double[] { Double.NaN, Double.NaN }; // Opcional: invalidar se fora da faixa
+            }
+            return new double[] { dstCoord.x, dstCoord.y }; 
+        } catch (Exception e) { // Capturar exceção mais genérica
+             logger.log(Level.SEVERE, "GeoUtils: Erro durante a transformação de True UTM (" + trueUtmX + ", " + trueUtmY + ") para Geo: " + e.getClass().getName() + " - " + e.getMessage(), e);
             return new double[] { Double.NaN, Double.NaN };
         }
     }

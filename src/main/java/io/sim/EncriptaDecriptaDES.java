@@ -73,8 +73,8 @@ public class EncriptaDecriptaDES {
             
             // Converte a string para bytes e criptografa
             byte[] textoCifrado = cifraDES.doFinal(textoPlano.getBytes(StandardCharsets.UTF_8));
-            logger.info("Texto criptografado: " + textoCifrado);
-            logger.info("Texto criptografado: " + Base64.getEncoder().encodeToString(textoCifrado));
+            //logger.info("Texto criptografado: " + textoCifrado);
+            //logger.info("Texto criptografado: " + Base64.getEncoder().encodeToString(textoCifrado));
             // Converte os bytes criptografados para Base64 para facilitar o armazenamento/transmissão
             return Base64.getEncoder().encodeToString(textoCifrado);
         } catch (Exception e) {
@@ -91,7 +91,7 @@ public class EncriptaDecriptaDES {
      */
     public String descriptografar(String textoCifrado) throws Exception {
         try {
-            logger.info("Texto cifrado recebido para descriptografar: " + textoCifrado);
+            //logger.info("Texto cifrado recebido para descriptografar: " + textoCifrado);
 
             // Configura a cifra para o modo de descriptografia
             cifraDES.init(Cipher.DECRYPT_MODE, chaveDES);
